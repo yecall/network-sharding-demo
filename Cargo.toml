@@ -1,0 +1,25 @@
+[package]
+name = "network-sharding-demo"
+version = "0.1.0"
+authors = ["guoxbin <guobin@bit-rock.com>"]
+edition = "2018"
+
+[dependencies]
+structopt = "0.2"
+exit-future = "0.1"
+futures = "0.1"
+libp2p = { version = "0.7.0", default-features = false, features = ["secio-secp256k1", "libp2p-websocket"] }
+tokio = "0.1"
+tokio-io = "0.1"
+tokio-timer = "0.2"
+log = "0.4"
+parity-codec = { version = "3.2", default-features = false, features = ["derive"] }
+primitive-types = { version = "0.2", default-features = false, features = ["codec"]}
+secp256k1 = {version="0.12", default-features = false, features = ["rand"]}
+env_logger = "0.6"
+
+[features]
+default = ["std"]
+std = [
+    "primitive-types/std",
+]
