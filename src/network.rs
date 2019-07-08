@@ -16,6 +16,8 @@ use std::{str::FromStr, net::{Ipv4Addr, SocketAddr}, iter};
 use libp2p::identity::{Keypair, secp256k1::SecretKey};
 use libp2p::identify::{Identify, IdentifyEvent, protocol::IdentifyInfo};
 
+const PROTOCOL_VERSION : &str = "network-sharding-demo";
+
 #[derive(NetworkBehaviour)]
 pub struct Behavior<TSubstream> {
     discovery: DiscoveryBehaviour<TSubstream>,
@@ -203,7 +205,7 @@ impl<TSubstream> NetworkBehaviourEventProcess<IdentifyEvent> for Behavior<TSubst
                 // TODO: ideally we would delay the first identification to when we open the custom
                 //	protocol, so that we only report id info to the service about the nodes we
                 //	care about (https://github.com/libp2p/rust-libp2p/issues/876)
-                if !info.protocol_version.contains("network-sharding-demo") {
+                if !info.protocol_version.contains(PROTOCOL_VERSION) {
                     warn!(target: "sub-libp2p", "Connected to a non-Substrate node: {:?}", info);
                 }
                 if info.listen_addrs.len() > 30 {
@@ -272,7 +274,7 @@ pub fn run_network(cmd: RunCmd) {
     info!(target: "sub-libp2p", "Local node identity is: {}", local_peer_id.to_base58());
 
     let user_agent = "".to_string();
-    let proto_version = "network-sharding-demo".to_string();
+    let proto_version = PROTOCOL_VERSION.to_string();
 
     let transport = libp2p::build_development_transport(local_identity);
 
