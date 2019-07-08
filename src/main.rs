@@ -10,6 +10,9 @@ use crate::params::CoreParams::{Run, BootNodesRouter};
 use crate::network::run_network;
 use crate::bootnodes_router::run_bootnodes_router;
 
+#[macro_use]
+extern crate jsonrpc_client_core;
+
 #[derive(Clone)]
 pub struct VersionInfo {
     /// Implemtation name.

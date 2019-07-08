@@ -1,5 +1,6 @@
-use crate::params::RunCmd;
+use crate::params::{self, RunCmd, BootNodesRouterCmd};
 use crate::parse::parse_str_addr;
+use crate::bootnodes_router::bootnodes_router_client;
 use libp2p::core::{PeerId, Multiaddr, ProtocolsHandler, PublicKey, Swarm};
 use libp2p::core::swarm::{NetworkBehaviour, NetworkBehaviourEventProcess, NetworkBehaviourAction, PollParameters, ConnectedPoint};
 use futures::Async;
@@ -15,8 +16,11 @@ use primitive_types::H256;
 use std::{str::FromStr, net::{Ipv4Addr, SocketAddr}, iter};
 use libp2p::identity::{Keypair, secp256k1::SecretKey};
 use libp2p::identify::{Identify, IdentifyEvent, protocol::IdentifyInfo};
+use crate::bootnodes_router::{BootnodesRouterConf, Shard};
+use std::error::Error;
+use parity_codec::alloc::collections::HashMap;
 
-const PROTOCOL_VERSION : &str = "network-sharding-demo";
+const PROTOCOL_VERSION: &str = "network-sharding-demo";
 
 #[derive(NetworkBehaviour)]
 pub struct Behavior<TSubstream> {
@@ -229,12 +233,48 @@ impl<TSubstream> NetworkBehaviourEventProcess<IdentifyEvent> for Behavior<TSubst
     }
 }
 
+fn get_bootnodes_router(cmd: &RunCmd) -> Result<BootnodesRouterConf, ()> {
+    let router = &cmd.bootnodes_router;
 
-pub fn run_network(cmd: RunCmd) {
+    for one in router {
+        info!("bootnodes_router: {}", one);
+        let mut client = bootnodes_router_client(one.to_string());
+        let result = client.bootnodes().call();
+
+        match result {
+            Ok(result) => return Ok(result),
+            Err(e) => { continue; }
+        }
+    }
+
+    Err(())
+}
+
+fn get_bootnodes(cmd: &RunCmd) -> Vec<(PeerId, Multiaddr)> {
+    let shard_num = cmd.shard_num;
+
+    let bootnodes_router = get_bootnodes_router(&cmd);
+
+    let mut shards : HashMap<String, Shard>;
+
+    let bootnodes_str =  match bootnodes_router {
+        Ok(result) => {
+            shards = result.shards;
+            let shard = shards.get(&format!("{}", shard_num));
+            match shard {
+                Some(shard) => &shard.bootnodes,
+                None => &cmd.bootnodes,
+            }
+        }
+        Err(e) => &cmd.bootnodes,
+    };
+
+    info!("bootnodes: {:?}", bootnodes_str);
+
     let mut bootnodes = Vec::new();
 
     // Process the bootnodes.
-    for bootnode in cmd.bootnodes.iter() {
+    for bootnode in bootnodes_str.iter() {
         match parse_str_addr(bootnode) {
             Ok((peer_id, addr)) => {
                 bootnodes.push((peer_id, addr));
@@ -242,6 +282,13 @@ pub fn run_network(cmd: RunCmd) {
             Err(_) => warn!(target: "sub-libp2p", "Not a valid bootnode address: {}", bootnode),
         }
     }
+
+    bootnodes
+}
+
+
+pub fn run_network(cmd: RunCmd) {
+    let bootnodes = get_bootnodes(&cmd);
 
     let to_dial = bootnodes.clone();
 
@@ -257,9 +304,9 @@ pub fn run_network(cmd: RunCmd) {
     Protocol::Ip4(Ipv4Addr::new(0, 0, 0, 0));
 
     // Process listen_addresses
-    let port = match cmd.port {
+    let port = match cmd.shared_params.port {
         Some(port) => port,
-        None => 60001,
+        None => params::DEFAULT_PORT,
     };
 
     let listen_addresses: Vec<Multiaddr> = vec![
@@ -278,7 +325,7 @@ pub fn run_network(cmd: RunCmd) {
 
     let transport = libp2p::build_development_transport(local_identity);
 
-    let behavior = Behavior::new( proto_version,user_agent, local_public, bootnodes);
+    let behavior = Behavior::new(proto_version, user_agent, local_public, bootnodes);
 
     let mut swarm = libp2p::Swarm::new(transport, behavior, local_peer_id);
 

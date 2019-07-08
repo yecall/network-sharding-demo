@@ -4,6 +4,10 @@ use app_dirs::{self, AppInfo, AppDataType};
 use crate::VersionInfo;
 use clap::{App, SubCommand, AppSettings};
 
+pub const DEFAULT_PORT : u16 = 60001;
+pub const DEFAULT_BOOTNODES_ROUTER_PORT : u16 = 50001;
+
+
 #[derive(Debug, Clone)]
 pub enum CoreParams {
     Run(RunCmd),
@@ -15,11 +19,14 @@ pub struct RunCmd {
     #[structopt(long = "bootnodes", value_name = "URL")]
     pub bootnodes: Vec<String>,
 
+    #[structopt(long = "bootnodes-router", value_name = "URL")]
+    pub bootnodes_router: Vec<String>,
+
     #[structopt(long = "node-key", value_name = "KEY")]
     pub node_key: Option<String>,
 
-    #[structopt(long = "port", value_name = "PORT")]
-    pub port: Option<u16>,
+    #[structopt(long = "shard-num", value_name = "SHARD_NUM")]
+    pub shard_num: u16,
 
     #[allow(missing_docs)]
     #[structopt(flatten)]
@@ -37,6 +44,9 @@ pub struct BootNodesRouterCmd{
 
 #[derive(Debug, StructOpt, Clone)]
 pub struct SharedParams {
+
+    #[structopt(long = "port", value_name = "PORT")]
+    pub port: Option<u16>,
 
     /// Specify custom base path.
     #[structopt(long = "base-path", short = "d", value_name = "PATH", parse(from_os_str))]

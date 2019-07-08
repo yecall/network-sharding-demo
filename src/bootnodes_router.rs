@@ -1,6 +1,6 @@
 use crate::params::BootNodesRouterCmd;
 use crate::VersionInfo;
-use crate::params::{base_path, conf_path};
+use crate::params::{self, base_path, conf_path};
 use futures::future::Future;
 use log::{debug, info, trace, warn};
 use std::fs::File;
@@ -10,20 +10,21 @@ use std::path::PathBuf;
 use std::collections::HashMap;
 use jsonrpc_core::IoHandler;
 use jsonrpc_derive::rpc;
-use http::ServerBuilder;
+use jsonrpc_http_server::ServerBuilder;
 use std::thread;
 use futures::{prelude::*, future};
+use jsonrpc_client_http::{self, HttpTransport, HttpHandle};
 
-#[derive(Serialize,Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[derive(Debug, Clone)]
-struct Shard {
-    bootnodes: Vec<String>,
+pub struct Shard {
+    pub bootnodes: Vec<String>,
 }
 
-#[derive(Serialize,Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[derive(Debug, Clone)]
-struct BootnodesRouterConf {
-    shards: HashMap<String, Shard>,
+pub struct BootnodesRouterConf {
+    pub shards: HashMap<String, Shard>,
 }
 
 fn get_bootnodes_router_conf(conf_path: &PathBuf) -> BootnodesRouterConf {
@@ -48,7 +49,6 @@ fn get_bootnodes_router_conf(conf_path: &PathBuf) -> BootnodesRouterConf {
 }
 
 fn start_bootnodes_router(cmd: BootNodesRouterCmd, version: VersionInfo) {
-
     let thread = thread::Builder::new().name("bootnodes_router".to_string()).spawn(move || {
         start_http(cmd, version);
     });
@@ -56,20 +56,26 @@ fn start_bootnodes_router(cmd: BootNodesRouterCmd, version: VersionInfo) {
     info!("Run bootnodes router successfully");
 }
 
-fn start_http(cmd: BootNodesRouterCmd, version: VersionInfo){
-
+fn start_http(cmd: BootNodesRouterCmd, version: VersionInfo) {
     let conf_path = conf_path(&base_path(cmd.shared_params.base_path, version));
 
     let conf: BootnodesRouterConf = get_bootnodes_router_conf(&conf_path);
 
     info!("bootnodes router_conf={:?}", conf);
 
+    let port = match cmd.shared_params.port {
+        Some(port) => port,
+        None => params::DEFAULT_BOOTNODES_ROUTER_PORT,
+    };
+
     let io = rpc_handler(conf);
+    let addr = format!("0.0.0.0:{}", port);
     let server = ServerBuilder::new(io).
-        threads(4).start_http(&"127.0.0.1:3030".parse().unwrap()).unwrap();
+        threads(4).start_http(&addr.parse().unwrap()).unwrap();
+
+    info!("bootnodes router listen on: {}", addr);
 
     server.wait();
-
 }
 
 pub fn run_bootnodes_router(cmd: BootNodesRouterCmd, version: VersionInfo) {
@@ -83,7 +89,7 @@ pub fn run_bootnodes_router(cmd: BootNodesRouterCmd, version: VersionInfo) {
 }
 
 fn rpc_handler(conf: BootnodesRouterConf) -> IoHandler<()> {
-    let bootnodes_router_impl = BootnodesRouterImpl{conf};
+    let bootnodes_router_impl = BootnodesRouterImpl { conf };
     let mut io = jsonrpc_core::IoHandler::new();
     io.extend_with(bootnodes_router_impl.to_delegate());
     io
@@ -103,4 +109,19 @@ impl BootnodesRouter for BootnodesRouterImpl {
     fn bootnodes(&self) -> jsonrpc_core::Result<BootnodesRouterConf> {
         Ok(self.conf.clone())
     }
+}
+
+jsonrpc_client!(pub struct BootnodesRouterClient {
+    pub fn bootnodes(&mut self) -> RpcRequest<BootnodesRouterConf>;
+});
+
+pub fn bootnodes_router_client(uri: String) -> BootnodesRouterClient<HttpHandle> {
+    let transport = HttpTransport::new().standalone().unwrap();
+    let transport_handle = transport
+        .handle(&uri)
+        .unwrap();
+
+    let a = BootnodesRouterClient::new(transport_handle);
+
+    a
 }
