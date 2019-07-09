@@ -16,9 +16,11 @@ use primitive_types::H256;
 use std::{str::FromStr, net::{Ipv4Addr, SocketAddr}, iter};
 use libp2p::identity::{Keypair, secp256k1::SecretKey};
 use libp2p::identify::{Identify, IdentifyEvent, protocol::IdentifyInfo};
+use libp2p::floodsub::{Floodsub, FloodsubEvent};
 use crate::bootnodes_router::{BootnodesRouterConf, Shard};
 use std::error::Error;
 use parity_codec::alloc::collections::HashMap;
+use libp2p::tokio_codec::{FramedRead, LinesCodec};
 
 const PROTOCOL_VERSION: &str = "network-sharding-demo/1.0.0";
 
@@ -28,6 +30,7 @@ const USERAGENT_SHARD: &str = "shard";
 pub struct Behavior<TSubstream> {
     discovery: DiscoveryBehaviour<TSubstream>,
     identify: Identify<TSubstream>,
+    floodsub: Floodsub<TSubstream>,
 
     #[behaviour(ignore)]
     shard_num: u16,
@@ -52,6 +55,8 @@ impl<TSubstream> Behavior<TSubstream> {
 
         let identify = Identify::new(protocol_version, user_agent, local_public_key.clone());
 
+        let floodsub = Floodsub::new(local_public_key.clone().into_peer_id());
+
         Behavior {
             discovery: DiscoveryBehaviour {
                 user_defined: user_defined,
@@ -62,6 +67,7 @@ impl<TSubstream> Behavior<TSubstream> {
                 local_peer_id: local_public_key.into_peer_id(),
             },
             identify: identify,
+            floodsub: floodsub,
             shard_num: shard_num,
         }
     }
@@ -231,13 +237,23 @@ impl<TSubstream> NetworkBehaviourEventProcess<IdentifyEvent> for Behavior<TSubst
                 for addr in &info.listen_addrs {
                     self.discovery.kademlia.add_connected_address(&peer_id, addr.clone());
                 }
-                info!(target: "sub-libp2p", "Should add discovered node, Identified: {}", peer_id);
+                info!(target: "sub-libp2p", "Add discovered node, Identified: {}", peer_id);
+                self.floodsub.add_node_to_partial_view(peer_id);
             }
             IdentifyEvent::Error { .. } => {}
             IdentifyEvent::SendBack { result: Err(ref err), ref peer_id } =>
                 debug!(target: "sub-libp2p", "Error when sending back identify info \
 					to {:?} => {}", peer_id, err),
             IdentifyEvent::SendBack { .. } => {}
+        }
+    }
+}
+
+impl<TSubstream> NetworkBehaviourEventProcess<FloodsubEvent> for Behavior<TSubstream> {
+    // Called when `floodsub` produces an event.
+    fn inject_event(&mut self, message: FloodsubEvent) {
+        if let FloodsubEvent::Message(message) = message {
+            info!(target: "sub-libp2p", "Received: '{:?}' from {:?}", String::from_utf8_lossy(&message.data), message.source);
         }
     }
 }
@@ -335,9 +351,17 @@ pub fn run_network(cmd: RunCmd) {
 
     let transport = libp2p::build_development_transport(local_identity);
 
-    let behavior = Behavior::new(protocol_version, user_agent, local_public, bootnodes, cmd.shard_num);
+    // Create a Floodsub topic
+    let floodsub_topic = libp2p::floodsub::TopicBuilder::new("sync").build();
 
-    let mut swarm = libp2p::Swarm::new(transport, behavior, local_peer_id);
+    let mut swarm = {
+
+        let mut behavior = Behavior::new(protocol_version, user_agent, local_public, bootnodes, cmd.shard_num);
+
+        behavior.floodsub.subscribe(floodsub_topic.clone());
+
+        libp2p::Swarm::new(transport, behavior, local_peer_id)
+    };
 
     for listen_address in &listen_addresses {
         ;
@@ -350,10 +374,23 @@ pub fn run_network(cmd: RunCmd) {
         Swarm::dial(&mut swarm, peer_id);
     }
 
+    let stdin = tokio_stdin_stdout::stdin(0);
+    let mut framed_stdin = FramedRead::new(stdin, LinesCodec::new());
+
     let mut listening = false;
 
     let thread = thread::Builder::new().name("network".to_string()).spawn(move || {
         tokio::run(future::poll_fn(move || -> Result<_, ()> {
+            loop {
+                match framed_stdin.poll().expect("Error while polling stdin") {
+                    Async::Ready(Some(line)) => {
+                        swarm.floodsub.publish(&floodsub_topic, line.as_bytes());
+                    }
+                    Async::Ready(None) => panic!("Stdin closed"),
+                    Async::NotReady => break,
+                };
+            }
+
             loop {
                 match swarm.poll().expect("Error while polling swarm") {
                     Async::Ready(Some(e)) => println!("{:?}", e),
