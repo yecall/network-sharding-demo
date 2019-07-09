@@ -20,7 +20,9 @@ use crate::bootnodes_router::{BootnodesRouterConf, Shard};
 use std::error::Error;
 use parity_codec::alloc::collections::HashMap;
 
-const PROTOCOL_VERSION: &str = "network-sharding-demo";
+const PROTOCOL_VERSION: &str = "network-sharding-demo/1.0.0";
+
+const USERAGENT_SHARD: &str = "shard";
 
 #[derive(NetworkBehaviour)]
 pub struct Behavior<TSubstream> {
@@ -28,15 +30,16 @@ pub struct Behavior<TSubstream> {
     identify: Identify<TSubstream>,
 
     #[behaviour(ignore)]
-    proto_version: String,
+    shard_num: u16,
 }
 
 impl<TSubstream> Behavior<TSubstream> {
     pub fn new(
-        proto_version: String,
+        protocol_version: String,
         user_agent: String,
         local_public_key: PublicKey,
         bootnodes: Vec<(PeerId, Multiaddr)>,
+        shard_num: u16,
     ) -> Self {
         let mut kademlia = Kademlia::new(local_public_key.clone().into_peer_id());
         for (peer_id, addr) in &bootnodes {
@@ -47,7 +50,7 @@ impl<TSubstream> Behavior<TSubstream> {
 
         let user_defined = bootnodes.clone();
 
-        let identify = Identify::new(proto_version.clone(), user_agent, local_public_key.clone());
+        let identify = Identify::new(protocol_version, user_agent, local_public_key.clone());
 
         Behavior {
             discovery: DiscoveryBehaviour {
@@ -59,7 +62,7 @@ impl<TSubstream> Behavior<TSubstream> {
                 local_peer_id: local_public_key.into_peer_id(),
             },
             identify: identify,
-            proto_version: proto_version,
+            shard_num: shard_num,
         }
     }
 }
@@ -185,7 +188,7 @@ impl<TSubstream> NetworkBehaviourEventProcess<KademliaOut> for Behavior<TSubstre
         match out {
             KademliaOut::Discovered { .. } => {}
             KademliaOut::KBucketAdded { peer_id, .. } => {
-                info!(target: "sub-libp2p", "Should add discovered node, KBucketAdded: {}", peer_id);
+                info!(target: "sub-libp2p", "KBucketAdded: {}", peer_id);
             }
             KademliaOut::FindNodeResult { key, closer_peers } => {
                 trace!(target: "sub-libp2p", "Libp2p => Query for {:?} yielded {:?} results",
@@ -209,8 +212,14 @@ impl<TSubstream> NetworkBehaviourEventProcess<IdentifyEvent> for Behavior<TSubst
                 // TODO: ideally we would delay the first identification to when we open the custom
                 //	protocol, so that we only report id info to the service about the nodes we
                 //	care about (https://github.com/libp2p/rust-libp2p/issues/876)
-                if !info.protocol_version.contains(PROTOCOL_VERSION) {
-                    warn!(target: "sub-libp2p", "Connected to a non-Substrate node: {:?}", info);
+                if !info.protocol_version.eq(PROTOCOL_VERSION) {
+                    warn!(target: "sub-libp2p", "Connected to a node with different protocol version : {:?}, will not treat as discovered", info);
+                    return;
+                }
+                let shard_token = format!("{}/{}", USERAGENT_SHARD, self.shard_num);
+                if !info.agent_version.contains(&shard_token) {
+                    warn!(target: "sub-libp2p", "Connected to a node on different shard : {:?}, will not treat as discovered", info);
+                    return;
                 }
                 if info.listen_addrs.len() > 30 {
                     warn!(target: "sub-libp2p", "Node {:?} has reported more than 30 addresses; \
@@ -255,9 +264,9 @@ fn get_bootnodes(cmd: &RunCmd) -> Vec<(PeerId, Multiaddr)> {
 
     let bootnodes_router = get_bootnodes_router(&cmd);
 
-    let mut shards : HashMap<String, Shard>;
+    let mut shards: HashMap<String, Shard>;
 
-    let bootnodes_str =  match bootnodes_router {
+    let bootnodes_str = match bootnodes_router {
         Ok(result) => {
             shards = result.shards;
             let shard = shards.get(&format!("{}", shard_num));
@@ -285,7 +294,6 @@ fn get_bootnodes(cmd: &RunCmd) -> Vec<(PeerId, Multiaddr)> {
 
     bootnodes
 }
-
 
 pub fn run_network(cmd: RunCmd) {
     let bootnodes = get_bootnodes(&cmd);
@@ -320,12 +328,14 @@ pub fn run_network(cmd: RunCmd) {
     let local_peer_id = local_public.clone().into_peer_id();
     info!(target: "sub-libp2p", "Local node identity is: {}", local_peer_id.to_base58());
 
-    let user_agent = "".to_string();
-    let proto_version = PROTOCOL_VERSION.to_string();
+    let user_agent = format!("{}/{}", USERAGENT_SHARD, &cmd.shard_num);
+    let protocol_version = PROTOCOL_VERSION.to_string();
+
+    info!(target: "sub-libp2p", "Local node protocol version: {}, user agent: {}", protocol_version, user_agent);
 
     let transport = libp2p::build_development_transport(local_identity);
 
-    let behavior = Behavior::new(proto_version, user_agent, local_public, bootnodes);
+    let behavior = Behavior::new(protocol_version, user_agent, local_public, bootnodes, cmd.shard_num);
 
     let mut swarm = libp2p::Swarm::new(transport, behavior, local_peer_id);
 
