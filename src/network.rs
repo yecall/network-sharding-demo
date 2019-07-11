@@ -1,14 +1,14 @@
 use crate::params::{self, RunCmd, BootNodesRouterCmd};
 use crate::parse::parse_str_addr;
 use crate::bootnodes_router::bootnodes_router_client;
-use libp2p::core::{PeerId, Multiaddr, ProtocolsHandler, PublicKey, Swarm};
+use libp2p::core::{PeerId, Multiaddr, ProtocolsHandler, PublicKey, Swarm, Endpoint, ProtocolsHandlerEvent};
 use libp2p::core::swarm::{NetworkBehaviour, NetworkBehaviourEventProcess, NetworkBehaviourAction, PollParameters, ConnectedPoint};
 use futures::Async;
 use libp2p::NetworkBehaviour;
 use std::{thread, cmp, time::Duration};
 use tokio_io::{AsyncRead, AsyncWrite};
 use tokio_timer::{Delay, clock::Clock};
-use log::{debug, info, trace, warn};
+use log::{debug, info, trace, warn, error};
 use libp2p::multiaddr::Protocol;
 use libp2p::kad::{Kademlia, KademliaOut};
 use futures::{prelude::*, future};
@@ -17,10 +17,21 @@ use std::{str::FromStr, net::{Ipv4Addr, SocketAddr}, iter};
 use libp2p::identity::{Keypair, secp256k1::SecretKey};
 use libp2p::identify::{Identify, IdentifyEvent, protocol::IdentifyInfo};
 use libp2p::floodsub::{Floodsub, FloodsubEvent};
+use libp2p::core::protocols_handler::{SubstreamProtocol, ProtocolsHandlerUpgrErr, KeepAlive, IntoProtocolsHandler};
+use libp2p::core::upgrade::{self, InboundUpgrade, OutboundUpgrade};
 use crate::bootnodes_router::{BootnodesRouterConf, Shard};
 use std::error::Error;
 use parity_codec::alloc::collections::HashMap;
 use libp2p::tokio_codec::{FramedRead, LinesCodec};
+use smallvec::SmallVec;
+use std::borrow::Cow;
+use std::marker::PhantomData;
+use std::error;
+use std::fmt;
+use std::io;
+use std::time::Instant;
+use void;
+use std::mem;
 
 const PROTOCOL_VERSION: &str = "network-sharding-demo/1.0.0";
 
@@ -31,9 +42,13 @@ pub struct Behavior<TSubstream> {
     discovery: DiscoveryBehaviour<TSubstream>,
     identify: Identify<TSubstream>,
     floodsub: Floodsub<TSubstream>,
+    work: WorkBehaviour<TSubstream>,
 
     #[behaviour(ignore)]
     shard_num: u16,
+
+    #[behaviour(ignore)]
+    events: Vec<BehaviourOut>,
 }
 
 impl<TSubstream> Behavior<TSubstream> {
@@ -44,6 +59,7 @@ impl<TSubstream> Behavior<TSubstream> {
         bootnodes: Vec<(PeerId, Multiaddr)>,
         shard_num: u16,
     ) -> Self {
+
         let mut kademlia = Kademlia::new(local_public_key.clone().into_peer_id());
         for (peer_id, addr) in &bootnodes {
             kademlia.add_connected_address(peer_id, addr.clone());
@@ -57,6 +73,8 @@ impl<TSubstream> Behavior<TSubstream> {
 
         let floodsub = Floodsub::new(local_public_key.clone().into_peer_id());
 
+        let mut work = WorkBehaviour::new();
+
         Behavior {
             discovery: DiscoveryBehaviour {
                 user_defined: user_defined,
@@ -68,8 +86,575 @@ impl<TSubstream> Behavior<TSubstream> {
             },
             identify: identify,
             floodsub: floodsub,
+            work: work,
             shard_num: shard_num,
+            events: Vec::new(),
         }
+    }
+}
+
+pub struct WorkBehaviour<TSubstream>{
+
+    events: SmallVec<[NetworkBehaviourAction<WorkHandlerIn, WorkOut>; 4]>,
+
+    /// Marker to pin the generics.
+    marker: PhantomData<TSubstream>,
+}
+
+impl<TSubstream> WorkBehaviour<TSubstream> {
+    /// Creates a `WorkBehaviour`.
+    pub fn new() -> Self {
+        WorkBehaviour {
+            events: SmallVec::new(),
+            marker: PhantomData,
+        }
+    }
+}
+
+enum ProtocolState {
+    /// Waiting for the behaviour to tell the handler whether it is enabled or disabled.
+    Init {
+        /// Deadline after which the initialization is abnormally long.
+        init_deadline: Delay,
+    },
+
+    /// Handler is opening a substream in order to activate itself.
+    /// If we are in this state, we haven't sent any `CustomProtocolOpen` yet.
+    Opening {
+        /// Deadline after which the opening is abnormally long.
+        deadline: Delay,
+    },
+
+    /// Normal operating mode. Contains the substreams that are open.
+    /// If we are in this state, we have sent a `CustomProtocolOpen` message to the outside.
+    Normal,
+
+    /// We are disabled. Contains substreams that are being closed.
+    /// If we are in this state, either we have sent a `CustomProtocolClosed` message to the
+    /// outside or we have never sent any `CustomProtocolOpen` in the first place.
+    Disabled {
+        /// If true, we should reactivate the handler after all the substreams in `shutdown` have
+        /// been closed.
+        ///
+        /// Since we don't want to mix old and new substreams, we wait for all old substreams to
+        /// be closed before opening any new one.
+        reenable: bool,
+    },
+
+    /// In this state, we don't care about anything anymore and need to kill the connection as soon
+    /// as possible.
+    KillAsap,
+
+    /// We sometimes temporarily switch to this state during processing. If we are in this state
+    /// at the beginning of a method, that means something bad happend in the source code.
+    Poisoned,
+}
+
+#[derive(Debug)]
+pub enum WorkHandlerIn {
+    /// The node should start using custom protocols. Contains whether we are the dialer or the
+    /// listener of the connection.
+    Enable(Endpoint),
+
+    /// The node should stop using custom protocols.
+    Disable,
+
+    /// Sends a message through a custom protocol substream.
+    SendCustomMessage {
+        /// The message to send.
+        message: String,
+    },
+}
+
+#[derive(Debug)]
+pub enum WorkHandlerOut {
+    /// Opened a custom protocol with the remote.
+    WorkOpen {
+        /// Version of the protocol that has been opened.
+        version: u8,
+    },
+
+    /// Closed a custom protocol with the remote.
+    WorkClosed {
+        /// Reason why the substream closed, for diagnostic purposes.
+        reason: Cow<'static, str>,
+    },
+
+    /// Receives a message on a custom protocol substream.
+    CustomMessage {
+        /// Message that has been received.
+        message: String,
+    },
+
+    /// An error has happened on the protocol level with this node.
+    ProtocolError {
+        /// If true the error is severe, such as a protocol violation.
+        is_severe: bool,
+        /// The error that happened.
+        error: Box<dyn error::Error + Send + Sync>,
+    },
+}
+
+#[derive(Debug)]
+pub enum WorkOut {
+    /// Opened a custom protocol with the remote.
+    WorkOpen {
+        /// Version of the protocol that has been opened.
+        version: u8,
+        /// Id of the node we have opened a connection with.
+        peer_id: PeerId,
+        /// Endpoint used for this custom protocol.
+        endpoint: ConnectedPoint,
+    },
+
+    /// Closed a custom protocol with the remote.
+    WorkClosed {
+        /// Id of the peer we were connected to.
+        peer_id: PeerId,
+        /// Reason why the substream closed, for debugging purposes.
+        reason: Cow<'static, str>,
+    },
+
+    /// Receives a message on a custom protocol substream.
+    CustomMessage {
+        /// Id of the peer the message came from.
+        peer_id: PeerId,
+        /// Message that has been received.
+        message: String,
+    },
+}
+
+#[derive(Debug)]
+pub enum BehaviourOut {
+    /// Opened a custom protocol with the remote.
+    WorkOpen {
+        /// Version of the protocol that has been opened.
+        version: u8,
+        /// Id of the node we have opened a connection with.
+        peer_id: PeerId,
+        /// Endpoint used for this custom protocol.
+        endpoint: ConnectedPoint,
+    },
+
+    /// Closed a custom protocol with the remote.
+    WorkClosed {
+        /// Id of the peer we were connected to.
+        peer_id: PeerId,
+        /// Reason why the substream closed, for diagnostic purposes.
+        reason: Cow<'static, str>,
+    },
+
+    /// Receives a message on a custom protocol substream.
+    CustomMessage {
+        /// Id of the peer the message came from.
+        peer_id: PeerId,
+        /// Message that has been received.
+        message: String,
+    },
+}
+
+impl From<WorkOut> for BehaviourOut {
+    fn from(other: WorkOut) -> BehaviourOut {
+        match other {
+            WorkOut::WorkOpen { version, peer_id, endpoint } => {
+                BehaviourOut::WorkOpen { version, peer_id, endpoint }
+            }
+            WorkOut::WorkClosed { peer_id, reason } => {
+                BehaviourOut::WorkClosed { peer_id, reason }
+            }
+            WorkOut::CustomMessage { peer_id, message } => {
+                BehaviourOut::CustomMessage { peer_id, message }
+            }
+        }
+    }
+}
+
+pub struct WorkProtocolsHandlerProto<TSubstream> {
+
+    /// Marker to pin the generic type.
+    marker: PhantomData<TSubstream>,
+}
+
+impl<TSubstream> IntoProtocolsHandler for WorkProtocolsHandlerProto<TSubstream>
+    where
+        TSubstream: AsyncRead + AsyncWrite,
+{
+    type Handler = WorkProtocolsHandler<TSubstream>;
+
+    fn into_handler(self, remote_peer_id: &PeerId) -> Self::Handler {
+        WorkProtocolsHandler {
+            remote_peer_id: remote_peer_id.clone(),
+            state: ProtocolState::Init {
+                init_deadline: Delay::new(Instant::now() + Duration::from_secs(5))
+            },
+            events_queue: SmallVec::new(),
+            marker: self.marker,
+        }
+    }
+}
+
+pub struct WorkProtocolsHandler<TSubstream> {
+
+    remote_peer_id: PeerId,
+
+    state: ProtocolState,
+
+    events_queue: SmallVec<[ProtocolsHandlerEvent<upgrade::DeniedUpgrade, (), WorkHandlerOut>; 16]>,
+
+    marker: PhantomData<TSubstream>,
+}
+
+impl<TSubstream> WorkProtocolsHandlerProto<TSubstream>
+    where
+        TSubstream: AsyncRead + AsyncWrite,
+{
+    /// Builds a new `WorkProtocolsHandler`.
+    pub fn new() -> Self {
+        WorkProtocolsHandlerProto {
+            marker: PhantomData,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct WorkError;
+
+impl error::Error for WorkError {
+}
+
+impl fmt::Display for WorkError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Work error")
+    }
+}
+
+impl<TSubstream> WorkProtocolsHandler<TSubstream>
+    where
+        TSubstream: AsyncRead + AsyncWrite,
+{
+    /// Enables the handler.
+    fn enable(&mut self, endpoint: Endpoint) {
+        self.state = match mem::replace(&mut self.state, ProtocolState::Poisoned) {
+            ProtocolState::Poisoned => {
+                error!(target: "sub-libp2p", "Handler with {:?} is in poisoned state",
+                       self.remote_peer_id);
+                ProtocolState::Poisoned
+            }
+
+            ProtocolState::Init { .. } => {
+
+                if let Endpoint::Dialer = endpoint {
+                    self.events_queue.push(ProtocolsHandlerEvent::OutboundSubstreamRequest {
+                        protocol: SubstreamProtocol::new(upgrade::DeniedUpgrade{}),
+                        info: (),
+                    });
+                }
+                ProtocolState::Opening {
+                    deadline: Delay::new(Instant::now() + Duration::from_secs(60))
+                }
+
+            }
+
+            st @ ProtocolState::KillAsap => st,
+            st @ ProtocolState::Opening { .. } => st,
+            st @ ProtocolState::Normal { .. } => st,
+            ProtocolState::Disabled { .. } => {
+                ProtocolState::Disabled { reenable: true }
+            }
+        }
+    }
+
+    /// Disables the handler.
+    fn disable(&mut self) {
+        self.state = match mem::replace(&mut self.state, ProtocolState::Poisoned) {
+            ProtocolState::Poisoned => {
+                error!(target: "sub-libp2p", "Handler with {:?} is in poisoned state",
+                       self.remote_peer_id);
+                ProtocolState::Poisoned
+            }
+
+            ProtocolState::Init { .. } => {
+                ProtocolState::Disabled { reenable: false }
+            }
+
+            ProtocolState::Opening { .. } | ProtocolState::Normal { .. } =>
+            // At the moment, if we get disabled while things were working, we kill the entire
+            // connection in order to force a reset of the state.
+            // This is obviously an extremely shameful way to do things, but at the time of
+            // the writing of this comment, the networking works very poorly and a solution
+            // needs to be found.
+                ProtocolState::KillAsap,
+
+            ProtocolState::Disabled { .. } =>
+                ProtocolState::Disabled { reenable: false },
+
+            ProtocolState::KillAsap => ProtocolState::KillAsap,
+        };
+    }
+
+    /// Polls the state for events. Optionally returns an event to produce.
+    #[must_use]
+    fn poll_state(&mut self)
+                  -> Option<ProtocolsHandlerEvent<upgrade::DeniedUpgrade, (), WorkHandlerOut>> {
+        match mem::replace(&mut self.state, ProtocolState::Poisoned) {
+            ProtocolState::Poisoned => {
+                error!(target: "sub-libp2p", "Handler with {:?} is in poisoned state",
+                       self.remote_peer_id);
+                self.state = ProtocolState::Poisoned;
+                None
+            }
+
+            ProtocolState::Init { mut init_deadline } => {
+                match init_deadline.poll() {
+                    Ok(Async::Ready(())) => {
+                        init_deadline.reset(Instant::now() + Duration::from_secs(60));
+                        debug!(target: "sub-libp2p", "Handler initialization process is too long \
+							with {:?}", self.remote_peer_id)
+                    },
+                    Ok(Async::NotReady) => {}
+                    Err(_) => error!(target: "sub-libp2p", "Tokio timer has errored")
+                }
+
+                self.state = ProtocolState::Init { init_deadline };
+                None
+            }
+
+            ProtocolState::Opening { mut deadline } => {
+                match deadline.poll() {
+                    Ok(Async::Ready(())) => {
+                        deadline.reset(Instant::now() + Duration::from_secs(60));
+                        let event = WorkHandlerOut::ProtocolError {
+                            is_severe: true,
+                            error: "Timeout when opening protocol".to_string().into(),
+                        };
+                        self.state = ProtocolState::Opening { deadline };
+                        Some(ProtocolsHandlerEvent::Custom(event))
+                    },
+                    Ok(Async::NotReady) => {
+                        self.state = ProtocolState::Opening { deadline };
+                        None
+                    },
+                    Err(_) => {
+                        error!(target: "sub-libp2p", "Tokio timer has errored");
+                        deadline.reset(Instant::now() + Duration::from_secs(60));
+                        self.state = ProtocolState::Opening { deadline };
+                        None
+                    },
+                }
+            }
+
+            ProtocolState::Normal => {
+
+                // This code is reached is none if and only if none of the substreams are in a ready state.
+                self.state = ProtocolState::Normal;
+                None
+            }
+
+            ProtocolState::Disabled { reenable } => {
+                // If `reenable` is `true`, that means we should open the substreams system again
+                // after all the substreams are closed.
+                if reenable {
+                    self.state = ProtocolState::Opening {
+                        deadline: Delay::new(Instant::now() + Duration::from_secs(60))
+                    };
+                    Some(ProtocolsHandlerEvent::OutboundSubstreamRequest {
+                        protocol: SubstreamProtocol::new(upgrade::DeniedUpgrade{}),
+                        info: (),
+                    })
+                } else {
+                    self.state = ProtocolState::Disabled { reenable };
+                    None
+                }
+            }
+
+            ProtocolState::KillAsap => None,
+        }
+    }
+
+    /// Called by `inject_fully_negotiated_inbound` and `inject_fully_negotiated_outbound`.
+    fn inject_fully_negotiated(
+        &mut self,
+        mut substream: void::Void
+    ) {
+        self.state = match mem::replace(&mut self.state, ProtocolState::Poisoned) {
+            ProtocolState::Poisoned => {
+                error!(target: "sub-libp2p", "Handler with {:?} is in poisoned state",
+                       self.remote_peer_id);
+                ProtocolState::Poisoned
+            }
+
+            ProtocolState::Init { init_deadline } => {
+                ProtocolState::Init { init_deadline }
+            }
+
+            ProtocolState::Opening { .. } => {
+                ProtocolState::Normal
+            }
+
+            ProtocolState::Normal => {
+                ProtocolState::Normal
+            }
+
+            ProtocolState::Disabled { .. } => {
+                ProtocolState::Disabled { reenable: false }
+            }
+
+            ProtocolState::KillAsap => ProtocolState::KillAsap,
+        };
+    }
+
+    /// Sends a message to the remote.
+    fn send_message(&mut self, message: String) {
+        match self.state {
+            ProtocolState::Normal => info!("Send message: {}", message),
+            _ => debug!(target: "sub-libp2p", "Tried to send message over closed protocol \
+				with {:?}", self.remote_peer_id)
+        }
+    }
+}
+
+
+impl<TSubstream> ProtocolsHandler for WorkProtocolsHandler<TSubstream>
+    where TSubstream: AsyncRead + AsyncWrite {
+    type InEvent = WorkHandlerIn;
+    type OutEvent = WorkHandlerOut;
+    type Substream = TSubstream;
+    type Error = WorkError;
+    type InboundProtocol = upgrade::DeniedUpgrade;
+    type OutboundProtocol = upgrade::DeniedUpgrade;
+    type OutboundOpenInfo = ();
+
+    fn listen_protocol(&self) -> SubstreamProtocol<Self::InboundProtocol> {
+        SubstreamProtocol::new(upgrade::DeniedUpgrade{})
+    }
+
+    fn inject_fully_negotiated_inbound(
+        &mut self,
+        proto: <Self::InboundProtocol as InboundUpgrade<TSubstream>>::Output
+    ) {
+        self.inject_fully_negotiated(proto);
+    }
+
+    fn inject_fully_negotiated_outbound(
+        &mut self,
+        proto: <Self::OutboundProtocol as OutboundUpgrade<TSubstream>>::Output,
+        _: Self::OutboundOpenInfo
+    ) {
+        self.inject_fully_negotiated(proto);
+    }
+
+    fn inject_event(&mut self, message: WorkHandlerIn) {
+        match message {
+            WorkHandlerIn::Disable => self.disable(),
+            WorkHandlerIn::Enable(endpoint) => self.enable(endpoint),
+            WorkHandlerIn::SendCustomMessage { message } =>
+                self.send_message(message),
+        }
+    }
+
+    #[inline]
+    fn inject_dial_upgrade_error(&mut self, _: (), err: ProtocolsHandlerUpgrErr<void::Void>) {
+        let is_severe = match err {
+            ProtocolsHandlerUpgrErr::Upgrade(_) => true,
+            _ => false,
+        };
+
+        self.events_queue.push(ProtocolsHandlerEvent::Custom(WorkHandlerOut::ProtocolError {
+            is_severe,
+            error: Box::new(err),
+        }));
+    }
+
+    fn connection_keep_alive(&self) -> KeepAlive {
+        match self.state {
+            ProtocolState::Init { .. } | ProtocolState::Opening { .. } |
+            ProtocolState::Normal { .. } => KeepAlive::Yes,
+            ProtocolState::Disabled { .. } | ProtocolState::Poisoned |
+            ProtocolState::KillAsap => KeepAlive::No,
+        }
+    }
+
+    fn poll(
+        &mut self,
+    ) -> Poll<
+        ProtocolsHandlerEvent<Self::OutboundProtocol, Self::OutboundOpenInfo, Self::OutEvent>,
+        Self::Error,
+    > {
+        // Flush the events queue if necessary.
+        if !self.events_queue.is_empty() {
+            let event = self.events_queue.remove(0);
+            return Ok(Async::Ready(event))
+        }
+
+        // Kill the connection if needed.
+        if let ProtocolState::KillAsap = self.state {
+            return Err(WorkError);
+        }
+
+        // Process all the substreams.
+        if let Some(event) = self.poll_state() {
+            return Ok(Async::Ready(event))
+        }
+
+        Ok(Async::NotReady)
+    }
+}
+
+impl<TSubstream> NetworkBehaviour for WorkBehaviour<TSubstream>
+    where
+        TSubstream: AsyncRead + AsyncWrite,
+{
+    type ProtocolsHandler = WorkProtocolsHandlerProto<TSubstream>;
+    type OutEvent = WorkOut;
+
+    fn new_handler(&mut self) -> Self::ProtocolsHandler {
+        WorkProtocolsHandlerProto::new()
+    }
+
+    fn addresses_of_peer(&mut self, _: &PeerId) -> Vec<Multiaddr> {
+        Vec::new()
+    }
+
+    fn inject_connected(&mut self, peer_id: PeerId, connected_point: ConnectedPoint) {
+        info!("WorkBehaviour inject_connected, peer_id: {}, connected_point: {:?}", peer_id, connected_point);
+    }
+
+    fn inject_disconnected(&mut self, peer_id: &PeerId, endpoint: ConnectedPoint) {
+        info!("WorkBehaviour inject_disconnected, peer_id: {}, endpoint: {:?}", peer_id, endpoint);
+    }
+
+    fn inject_addr_reach_failure(&mut self, peer_id: Option<&PeerId>, addr: &Multiaddr, error: &dyn error::Error) {
+        trace!(target: "sub-libp2p", "Libp2p => Reach failure for {:?} through {:?}: {:?}", peer_id, addr, error);
+    }
+
+    fn inject_dial_failure(&mut self, peer_id: &PeerId) {
+        info!("WorkBehaviour inject_dial_failure, peer_id: {}", peer_id);
+    }
+
+    fn inject_node_event(
+        &mut self,
+        source: PeerId,
+        event: WorkHandlerOut,
+    ) {
+        info!("WorkBehaviour inject_node_event, source: {}, event: {:?}", source, event);
+
+    }
+
+    fn poll(
+        &mut self,
+        _params: &mut PollParameters,
+    ) -> Async<
+        NetworkBehaviourAction<
+            WorkHandlerIn,
+            Self::OutEvent,
+        >,
+    > {
+
+        if !self.events.is_empty() {
+            return Async::Ready(self.events.remove(0))
+        }
+
+        Async::NotReady
     }
 }
 
@@ -119,6 +704,7 @@ impl<TSubstream> NetworkBehaviour for DiscoveryBehaviour<TSubstream>
     }
 
     fn inject_connected(&mut self, peer_id: PeerId, endpoint: ConnectedPoint) {
+        info!("DiscoveryBehaviour inject_connected, peer_id: {}, endpoint: {:?}", peer_id, endpoint);
         NetworkBehaviour::inject_connected(&mut self.kademlia, peer_id, endpoint)
     }
 
@@ -258,6 +844,12 @@ impl<TSubstream> NetworkBehaviourEventProcess<FloodsubEvent> for Behavior<TSubst
     }
 }
 
+impl<TSubstream> NetworkBehaviourEventProcess<WorkOut> for Behavior<TSubstream> {
+    fn inject_event(&mut self, event: WorkOut) {
+        self.events.push(event.into());
+    }
+}
+
 fn get_bootnodes_router(cmd: &RunCmd) -> Result<BootnodesRouterConf, ()> {
     let router = &cmd.bootnodes_router;
 
@@ -370,9 +962,10 @@ pub fn run_network(cmd: RunCmd) {
         }
     }
 
-    for (peer_id, _) in to_dial {
-        Swarm::dial(&mut swarm, peer_id);
-    }
+    //not need
+//    for (peer_id, _) in to_dial {
+//        Swarm::dial(&mut swarm, peer_id);
+//    }
 
     let stdin = tokio_stdin_stdout::stdin(0);
     let mut framed_stdin = FramedRead::new(stdin, LinesCodec::new());
