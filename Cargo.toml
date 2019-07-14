@@ -33,6 +33,9 @@ jsonrpc-http-server = "10.0.1"
 tokio-stdin-stdout = "0.1"
 smallvec = "0.6"
 void = "1"
+fnv = "1.0.6"
+unsigned-varint = { version = "0.2.1", features = ["codec"] }
+bytes = "0.4"
 
 [features]
 default = ["std"]

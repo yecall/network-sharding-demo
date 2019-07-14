@@ -1,9 +1,8 @@
 use crate::params::{self, RunCmd, BootNodesRouterCmd};
 use crate::parse::parse_str_addr;
 use crate::bootnodes_router::bootnodes_router_client;
-use libp2p::core::{PeerId, Multiaddr, ProtocolsHandler, PublicKey, Swarm, Endpoint, ProtocolsHandlerEvent};
+use libp2p::core::{PeerId, Multiaddr, ProtocolsHandler, PublicKey, Swarm, Endpoint, ProtocolsHandlerEvent, UpgradeInfo, Negotiated};
 use libp2p::core::swarm::{NetworkBehaviour, NetworkBehaviourEventProcess, NetworkBehaviourAction, PollParameters, ConnectedPoint};
-use futures::Async;
 use libp2p::NetworkBehaviour;
 use std::{thread, cmp, time::Duration};
 use tokio_io::{AsyncRead, AsyncWrite};
@@ -11,7 +10,8 @@ use tokio_timer::{Delay, clock::Clock};
 use log::{debug, info, trace, warn, error};
 use libp2p::multiaddr::Protocol;
 use libp2p::kad::{Kademlia, KademliaOut};
-use futures::{prelude::*, future};
+use libp2p::tokio_codec::{Framed, FramedRead, LinesCodec};
+use futures::{prelude::*, future, stream, Stream, stream::Fuse};
 use primitive_types::H256;
 use std::{str::FromStr, net::{Ipv4Addr, SocketAddr}, iter};
 use libp2p::identity::{Keypair, secp256k1::SecretKey};
@@ -22,8 +22,7 @@ use libp2p::core::upgrade::{self, InboundUpgrade, OutboundUpgrade};
 use crate::bootnodes_router::{BootnodesRouterConf, Shard};
 use std::error::Error;
 use parity_codec::alloc::collections::HashMap;
-use libp2p::tokio_codec::{FramedRead, LinesCodec};
-use smallvec::SmallVec;
+use smallvec::{smallvec, SmallVec};
 use std::borrow::Cow;
 use std::marker::PhantomData;
 use std::error;
@@ -32,16 +31,22 @@ use std::io;
 use std::time::Instant;
 use void;
 use std::mem;
+use fnv::FnvHashMap;
+use std::collections::VecDeque;
+use unsigned_varint::codec::UviBytes;
+use bytes::Bytes;
+use bytes::buf;
+use tokio_io::_tokio_codec;
 
 const PROTOCOL_VERSION: &str = "network-sharding-demo/1.0.0";
 
 const USERAGENT_SHARD: &str = "shard";
 
 #[derive(NetworkBehaviour)]
+#[behaviour(out_event = "BehaviourOut", poll_method = "poll")]
 pub struct Behavior<TSubstream> {
     discovery: DiscoveryBehaviour<TSubstream>,
     identify: Identify<TSubstream>,
-    floodsub: Floodsub<TSubstream>,
     work: WorkBehaviour<TSubstream>,
 
     #[behaviour(ignore)]
@@ -59,7 +64,6 @@ impl<TSubstream> Behavior<TSubstream> {
         bootnodes: Vec<(PeerId, Multiaddr)>,
         shard_num: u16,
     ) -> Self {
-
         let mut kademlia = Kademlia::new(local_public_key.clone().into_peer_id());
         for (peer_id, addr) in &bootnodes {
             kademlia.add_connected_address(peer_id, addr.clone());
@@ -71,9 +75,11 @@ impl<TSubstream> Behavior<TSubstream> {
 
         let identify = Identify::new(protocol_version, user_agent, local_public_key.clone());
 
-        let floodsub = Floodsub::new(local_public_key.clone().into_peer_id());
-
         let mut work = WorkBehaviour::new();
+
+        for (peer_id, addr) in &bootnodes {
+            work.events.push(NetworkBehaviourAction::DialPeer {peer_id: peer_id.clone()});
+        }
 
         Behavior {
             discovery: DiscoveryBehaviour {
@@ -85,17 +91,42 @@ impl<TSubstream> Behavior<TSubstream> {
                 local_peer_id: local_public_key.into_peer_id(),
             },
             identify: identify,
-            floodsub: floodsub,
             work: work,
             shard_num: shard_num,
             events: Vec::new(),
         }
     }
+
+    pub fn broadcast_custom_message(&mut self, data: String) {
+        let peer_ids = self.get_peer_ids();
+
+        for peer_id in peer_ids {
+            self.send_custom_message(&peer_id, data.clone());
+        }
+    }
+
+    pub fn get_peer_ids(&self) -> Vec<PeerId> {
+        let mut peer_ids: Vec<PeerId> = Vec::new();
+
+        for (peer_id, _) in &self.work.peers {
+            peer_ids.push(peer_id.clone());
+        }
+
+        peer_ids
+    }
+
+    #[inline]
+    pub fn send_custom_message(&mut self, target: &PeerId, data: String) {
+        self.work.send_packet(target, data)
+    }
 }
 
-pub struct WorkBehaviour<TSubstream>{
+pub struct WorkBehaviour<TSubstream> {
+    protocol: RegisteredProtocol,
 
     events: SmallVec<[NetworkBehaviourAction<WorkHandlerIn, WorkOut>; 4]>,
+
+    peers: FnvHashMap<PeerId, ()>,
 
     /// Marker to pin the generics.
     marker: PhantomData<TSubstream>,
@@ -105,15 +136,35 @@ impl<TSubstream> WorkBehaviour<TSubstream> {
     /// Creates a `WorkBehaviour`.
     pub fn new() -> Self {
         WorkBehaviour {
+            protocol: RegisteredProtocol { id: "/work".to_string() },
             events: SmallVec::new(),
+            peers: FnvHashMap::default(),
             marker: PhantomData,
         }
     }
+
+    pub fn send_packet(&mut self, target: &PeerId, message: String) {
+        info!("WorkBehaviour send_packet, target: {}, message: {}", target, message);
+        trace!(target: "sub-libp2p", "External API => Packet for {:?}", target);
+        trace!(target: "sub-libp2p", "Handler({:?}) <= Packet", target);
+        self.events.push(NetworkBehaviourAction::SendEvent {
+            peer_id: target.clone(),
+            event: WorkHandlerIn::SendCustomMessage {
+                message,
+            },
+        });
+    }
+
+    pub fn add_discovered_node(&mut self, peer_id: &PeerId) {
+        info!("WorkBehaviour add_discovered_node, peer_id: {}", peer_id);
+    }
 }
 
-enum ProtocolState {
+enum ProtocolState<TSubstream> {
     /// Waiting for the behaviour to tell the handler whether it is enabled or disabled.
     Init {
+        /// List of substreams opened by the remote but that haven't been processed yet.
+        substreams: SmallVec<[RegisteredProtocolSubstream<TSubstream>; 6]>,
         /// Deadline after which the initialization is abnormally long.
         init_deadline: Delay,
     },
@@ -127,12 +178,20 @@ enum ProtocolState {
 
     /// Normal operating mode. Contains the substreams that are open.
     /// If we are in this state, we have sent a `CustomProtocolOpen` message to the outside.
-    Normal,
+    Normal {
+        /// The substreams where bidirectional communications happen.
+        substreams: SmallVec<[RegisteredProtocolSubstream<TSubstream>; 4]>,
+        /// Contains substreams which are being shut down.
+        shutdown: SmallVec<[RegisteredProtocolSubstream<TSubstream>; 4]>,
+    },
 
     /// We are disabled. Contains substreams that are being closed.
     /// If we are in this state, either we have sent a `CustomProtocolClosed` message to the
     /// outside or we have never sent any `CustomProtocolOpen` in the first place.
     Disabled {
+        /// List of substreams to shut down.
+        shutdown: SmallVec<[RegisteredProtocolSubstream<TSubstream>; 6]>,
+
         /// If true, we should reactivate the handler after all the substreams in `shutdown` have
         /// been closed.
         ///
@@ -169,10 +228,7 @@ pub enum WorkHandlerIn {
 #[derive(Debug)]
 pub enum WorkHandlerOut {
     /// Opened a custom protocol with the remote.
-    WorkOpen {
-        /// Version of the protocol that has been opened.
-        version: u8,
-    },
+    WorkOpen,
 
     /// Closed a custom protocol with the remote.
     WorkClosed {
@@ -184,6 +240,13 @@ pub enum WorkHandlerOut {
     CustomMessage {
         /// Message that has been received.
         message: String,
+    },
+
+    /// A substream to the remote is clogged. The send buffer is very large, and we should print
+	/// a diagnostic message and/or avoid sending more data.
+    Clogged {
+        /// Copy of the messages that are within the buffer, for further diagnostic.
+        messages: Vec<String>,
     },
 
     /// An error has happened on the protocol level with this node.
@@ -270,9 +333,24 @@ impl From<WorkOut> for BehaviourOut {
 }
 
 pub struct WorkProtocolsHandlerProto<TSubstream> {
+    protocol: RegisteredProtocol,
 
     /// Marker to pin the generic type.
     marker: PhantomData<TSubstream>,
+}
+
+
+impl<TSubstream> WorkProtocolsHandlerProto<TSubstream>
+    where
+        TSubstream: AsyncRead + AsyncWrite,
+{
+    /// Builds a new `WorkProtocolsHandler`.
+    pub fn new(protocol: RegisteredProtocol) -> Self {
+        WorkProtocolsHandlerProto {
+            protocol: protocol,
+            marker: PhantomData,
+        }
+    }
 }
 
 impl<TSubstream> IntoProtocolsHandler for WorkProtocolsHandlerProto<TSubstream>
@@ -282,10 +360,13 @@ impl<TSubstream> IntoProtocolsHandler for WorkProtocolsHandlerProto<TSubstream>
     type Handler = WorkProtocolsHandler<TSubstream>;
 
     fn into_handler(self, remote_peer_id: &PeerId) -> Self::Handler {
+        info!("into WorkProtocolsHandler, remote_peer_id={}", remote_peer_id);
         WorkProtocolsHandler {
+            protocol: self.protocol,
             remote_peer_id: remote_peer_id.clone(),
             state: ProtocolState::Init {
-                init_deadline: Delay::new(Instant::now() + Duration::from_secs(5))
+                substreams: SmallVec::new(),
+                init_deadline: Delay::new(Instant::now() + Duration::from_secs(5)),
             },
             events_queue: SmallVec::new(),
             marker: self.marker,
@@ -294,33 +375,21 @@ impl<TSubstream> IntoProtocolsHandler for WorkProtocolsHandlerProto<TSubstream>
 }
 
 pub struct WorkProtocolsHandler<TSubstream> {
+    protocol: RegisteredProtocol,
 
     remote_peer_id: PeerId,
 
-    state: ProtocolState,
+    state: ProtocolState<TSubstream>,
 
-    events_queue: SmallVec<[ProtocolsHandlerEvent<upgrade::DeniedUpgrade, (), WorkHandlerOut>; 16]>,
+    events_queue: SmallVec<[ProtocolsHandlerEvent<RegisteredProtocol, (), WorkHandlerOut>; 16]>,
 
     marker: PhantomData<TSubstream>,
-}
-
-impl<TSubstream> WorkProtocolsHandlerProto<TSubstream>
-    where
-        TSubstream: AsyncRead + AsyncWrite,
-{
-    /// Builds a new `WorkProtocolsHandler`.
-    pub fn new() -> Self {
-        WorkProtocolsHandlerProto {
-            marker: PhantomData,
-        }
-    }
 }
 
 #[derive(Debug)]
 pub struct WorkError;
 
-impl error::Error for WorkError {
-}
+impl error::Error for WorkError {}
 
 impl fmt::Display for WorkError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -334,6 +403,7 @@ impl<TSubstream> WorkProtocolsHandler<TSubstream>
 {
     /// Enables the handler.
     fn enable(&mut self, endpoint: Endpoint) {
+        info!("WorkProtocolsHandler enable");
         self.state = match mem::replace(&mut self.state, ProtocolState::Poisoned) {
             ProtocolState::Poisoned => {
                 error!(target: "sub-libp2p", "Handler with {:?} is in poisoned state",
@@ -341,31 +411,39 @@ impl<TSubstream> WorkProtocolsHandler<TSubstream>
                 ProtocolState::Poisoned
             }
 
-            ProtocolState::Init { .. } => {
-
-                if let Endpoint::Dialer = endpoint {
-                    self.events_queue.push(ProtocolsHandlerEvent::OutboundSubstreamRequest {
-                        protocol: SubstreamProtocol::new(upgrade::DeniedUpgrade{}),
-                        info: (),
-                    });
+            ProtocolState::Init { substreams: incoming, .. } => {
+                if incoming.is_empty() {
+                    if let Endpoint::Dialer = endpoint {
+                        self.events_queue.push(ProtocolsHandlerEvent::OutboundSubstreamRequest {
+                            protocol: SubstreamProtocol::new(self.protocol.clone()),
+                            info: (),
+                        });
+                    }
+                    ProtocolState::Opening {
+                        deadline: Delay::new(Instant::now() + Duration::from_secs(60))
+                    }
+                } else {
+                    let event = WorkHandlerOut::WorkOpen;
+                    self.events_queue.push(ProtocolsHandlerEvent::Custom(event));
+                    ProtocolState::Normal {
+                        substreams: incoming.into_iter().collect(),
+                        shutdown: SmallVec::new(),
+                    }
                 }
-                ProtocolState::Opening {
-                    deadline: Delay::new(Instant::now() + Duration::from_secs(60))
-                }
-
             }
 
             st @ ProtocolState::KillAsap => st,
             st @ ProtocolState::Opening { .. } => st,
             st @ ProtocolState::Normal { .. } => st,
-            ProtocolState::Disabled { .. } => {
-                ProtocolState::Disabled { reenable: true }
+            ProtocolState::Disabled { shutdown, .. } => {
+                ProtocolState::Disabled { shutdown, reenable: true }
             }
         }
     }
 
     /// Disables the handler.
     fn disable(&mut self) {
+        info!("WorkProtocolsHandler  disable");
         self.state = match mem::replace(&mut self.state, ProtocolState::Poisoned) {
             ProtocolState::Poisoned => {
                 error!(target: "sub-libp2p", "Handler with {:?} is in poisoned state",
@@ -373,8 +451,11 @@ impl<TSubstream> WorkProtocolsHandler<TSubstream>
                 ProtocolState::Poisoned
             }
 
-            ProtocolState::Init { .. } => {
-                ProtocolState::Disabled { reenable: false }
+            ProtocolState::Init { substreams: mut shutdown, .. } => {
+                for s in &mut shutdown {
+                    s.shutdown();
+                }
+                ProtocolState::Disabled { shutdown, reenable: false }
             }
 
             ProtocolState::Opening { .. } | ProtocolState::Normal { .. } =>
@@ -385,8 +466,8 @@ impl<TSubstream> WorkProtocolsHandler<TSubstream>
             // needs to be found.
                 ProtocolState::KillAsap,
 
-            ProtocolState::Disabled { .. } =>
-                ProtocolState::Disabled { reenable: false },
+            ProtocolState::Disabled { shutdown, .. } =>
+                ProtocolState::Disabled { shutdown, reenable: false },
 
             ProtocolState::KillAsap => ProtocolState::KillAsap,
         };
@@ -395,7 +476,7 @@ impl<TSubstream> WorkProtocolsHandler<TSubstream>
     /// Polls the state for events. Optionally returns an event to produce.
     #[must_use]
     fn poll_state(&mut self)
-                  -> Option<ProtocolsHandlerEvent<upgrade::DeniedUpgrade, (), WorkHandlerOut>> {
+                  -> Option<ProtocolsHandlerEvent<RegisteredProtocol, (), WorkHandlerOut>> {
         match mem::replace(&mut self.state, ProtocolState::Poisoned) {
             ProtocolState::Poisoned => {
                 error!(target: "sub-libp2p", "Handler with {:?} is in poisoned state",
@@ -404,18 +485,18 @@ impl<TSubstream> WorkProtocolsHandler<TSubstream>
                 None
             }
 
-            ProtocolState::Init { mut init_deadline } => {
+            ProtocolState::Init { substreams, mut init_deadline } => {
                 match init_deadline.poll() {
                     Ok(Async::Ready(())) => {
                         init_deadline.reset(Instant::now() + Duration::from_secs(60));
                         debug!(target: "sub-libp2p", "Handler initialization process is too long \
 							with {:?}", self.remote_peer_id)
-                    },
+                    }
                     Ok(Async::NotReady) => {}
                     Err(_) => error!(target: "sub-libp2p", "Tokio timer has errored")
                 }
 
-                self.state = ProtocolState::Init { init_deadline };
+                self.state = ProtocolState::Init { substreams, init_deadline };
                 None
             }
 
@@ -429,40 +510,90 @@ impl<TSubstream> WorkProtocolsHandler<TSubstream>
                         };
                         self.state = ProtocolState::Opening { deadline };
                         Some(ProtocolsHandlerEvent::Custom(event))
-                    },
+                    }
                     Ok(Async::NotReady) => {
                         self.state = ProtocolState::Opening { deadline };
                         None
-                    },
+                    }
                     Err(_) => {
                         error!(target: "sub-libp2p", "Tokio timer has errored");
                         deadline.reset(Instant::now() + Duration::from_secs(60));
                         self.state = ProtocolState::Opening { deadline };
                         None
-                    },
+                    }
                 }
             }
 
-            ProtocolState::Normal => {
+            ProtocolState::Normal { mut substreams, mut shutdown } => {
+                for n in (0..substreams.len()).rev() {
+                    let mut substream = substreams.swap_remove(n);
+                    match substream.poll() {
+                        Ok(Async::NotReady) => substreams.push(substream),
+                        Ok(Async::Ready(Some(RegisteredProtocolEvent::Message(message)))) => {
+                            let event = WorkHandlerOut::CustomMessage {
+                                message
+                            };
+                            substreams.push(substream);
+                            self.state = ProtocolState::Normal { substreams, shutdown };
+                            return Some(ProtocolsHandlerEvent::Custom(event));
+                        }
+                        Ok(Async::Ready(Some(RegisteredProtocolEvent::Clogged { messages }))) => {
+                            let event = WorkHandlerOut::Clogged {
+                                messages,
+                            };
+                            substreams.push(substream);
+                            self.state = ProtocolState::Normal { substreams, shutdown };
+                            return Some(ProtocolsHandlerEvent::Custom(event));
+                        }
+                        Ok(Async::Ready(None)) => {
+                            shutdown.push(substream);
+                            if substreams.is_empty() {
+                                let event = WorkHandlerOut::WorkClosed {
+                                    reason: "All substreams have been closed by the remote".into(),
+                                };
+                                self.state = ProtocolState::Disabled {
+                                    shutdown: shutdown.into_iter().collect(),
+                                    reenable: true,
+                                };
+                                return Some(ProtocolsHandlerEvent::Custom(event));
+                            }
+                        }
+                        Err(err) => {
+                            if substreams.is_empty() {
+                                let event = WorkHandlerOut::WorkClosed {
+                                    reason: format!("Error on the last substream: {:?}", err).into(),
+                                };
+                                self.state = ProtocolState::Disabled {
+                                    shutdown: shutdown.into_iter().collect(),
+                                    reenable: true,
+                                };
+                                return Some(ProtocolsHandlerEvent::Custom(event));
+                            } else {
+                                debug!(target: "sub-libp2p", "Error on extra substream: {:?}", err);
+                            }
+                        }
+                    }
+                }
 
                 // This code is reached is none if and only if none of the substreams are in a ready state.
-                self.state = ProtocolState::Normal;
+                self.state = ProtocolState::Normal { substreams, shutdown };
                 None
             }
 
-            ProtocolState::Disabled { reenable } => {
+            ProtocolState::Disabled { mut shutdown, reenable } => {
+                shutdown_list(&mut shutdown);
                 // If `reenable` is `true`, that means we should open the substreams system again
                 // after all the substreams are closed.
-                if reenable {
+                if reenable && shutdown.is_empty() {
                     self.state = ProtocolState::Opening {
                         deadline: Delay::new(Instant::now() + Duration::from_secs(60))
                     };
                     Some(ProtocolsHandlerEvent::OutboundSubstreamRequest {
-                        protocol: SubstreamProtocol::new(upgrade::DeniedUpgrade{}),
+                        protocol: SubstreamProtocol::new(self.protocol.clone()),
                         info: (),
                     })
                 } else {
-                    self.state = ProtocolState::Disabled { reenable };
+                    self.state = ProtocolState::Disabled { shutdown, reenable };
                     None
                 }
             }
@@ -474,7 +605,7 @@ impl<TSubstream> WorkProtocolsHandler<TSubstream>
     /// Called by `inject_fully_negotiated_inbound` and `inject_fully_negotiated_outbound`.
     fn inject_fully_negotiated(
         &mut self,
-        mut substream: void::Void
+        mut substream: RegisteredProtocolSubstream<TSubstream>,
     ) {
         self.state = match mem::replace(&mut self.state, ProtocolState::Poisoned) {
             ProtocolState::Poisoned => {
@@ -483,20 +614,34 @@ impl<TSubstream> WorkProtocolsHandler<TSubstream>
                 ProtocolState::Poisoned
             }
 
-            ProtocolState::Init { init_deadline } => {
-                ProtocolState::Init { init_deadline }
+            ProtocolState::Init { mut substreams, init_deadline } => {
+                if substream.endpoint() == Endpoint::Dialer {
+                    error!(target: "sub-libp2p", "Opened dialing substream with {:?} before \
+						initialization", self.remote_peer_id);
+                }
+                substreams.push(substream);
+                ProtocolState::Init { substreams, init_deadline }
             }
 
             ProtocolState::Opening { .. } => {
-                ProtocolState::Normal
+                //info!("inject_fully_negotiated Opening, substream");
+                let event = WorkHandlerOut::WorkOpen;
+                self.events_queue.push(ProtocolsHandlerEvent::Custom(event));
+                ProtocolState::Normal {
+                    substreams: smallvec![substream],
+                    shutdown: SmallVec::new(),
+                }
             }
 
-            ProtocolState::Normal => {
-                ProtocolState::Normal
+            ProtocolState::Normal { substreams: mut existing, shutdown } => {
+                existing.push(substream);
+                ProtocolState::Normal { substreams: existing, shutdown }
             }
 
-            ProtocolState::Disabled { .. } => {
-                ProtocolState::Disabled { reenable: false }
+            ProtocolState::Disabled { mut shutdown, .. } => {
+                substream.shutdown();
+                shutdown.push(substream);
+                ProtocolState::Disabled { shutdown, reenable: false }
             }
 
             ProtocolState::KillAsap => ProtocolState::KillAsap,
@@ -505,11 +650,32 @@ impl<TSubstream> WorkProtocolsHandler<TSubstream>
 
     /// Sends a message to the remote.
     fn send_message(&mut self, message: String) {
+        //info!("WorkProtocolsHandler send_message");
         match self.state {
-            ProtocolState::Normal => info!("Send message: {}", message),
-            _ => debug!(target: "sub-libp2p", "Tried to send message over closed protocol \
+            ProtocolState::Normal { ref mut substreams, .. } =>
+                {
+                    //info!("WorkProtocolsHandler send_message normal");
+                    substreams[0].send_message(message);
+                },
+            _ => info!(target: "sub-libp2p", "Tried to send message over closed protocol \
 				with {:?}", self.remote_peer_id)
         }
+    }
+}
+
+fn shutdown_list<TSubstream>
+(list: &mut SmallVec<impl smallvec::Array<Item=RegisteredProtocolSubstream<TSubstream>>>)
+    where TSubstream: AsyncRead + AsyncWrite {
+    'outer: for n in (0..list.len()).rev() {
+        let mut substream = list.swap_remove(n);
+        loop {
+            match substream.poll() {
+                Ok(Async::Ready(Some(_))) => {}
+                Ok(Async::NotReady) => break,
+                Err(_) | Ok(Async::Ready(None)) => continue 'outer,
+            }
+        }
+        list.push(substream);
     }
 }
 
@@ -520,30 +686,33 @@ impl<TSubstream> ProtocolsHandler for WorkProtocolsHandler<TSubstream>
     type OutEvent = WorkHandlerOut;
     type Substream = TSubstream;
     type Error = WorkError;
-    type InboundProtocol = upgrade::DeniedUpgrade;
-    type OutboundProtocol = upgrade::DeniedUpgrade;
+    type InboundProtocol = RegisteredProtocol;
+    type OutboundProtocol = RegisteredProtocol;
     type OutboundOpenInfo = ();
 
     fn listen_protocol(&self) -> SubstreamProtocol<Self::InboundProtocol> {
-        SubstreamProtocol::new(upgrade::DeniedUpgrade{})
+        SubstreamProtocol::new(self.protocol.clone())
     }
 
     fn inject_fully_negotiated_inbound(
         &mut self,
-        proto: <Self::InboundProtocol as InboundUpgrade<TSubstream>>::Output
+        proto: <Self::InboundProtocol as InboundUpgrade<TSubstream>>::Output,
     ) {
+        info!("WorkProtocolsHandler inject_fully_negotiated_inbound");
         self.inject_fully_negotiated(proto);
     }
 
     fn inject_fully_negotiated_outbound(
         &mut self,
         proto: <Self::OutboundProtocol as OutboundUpgrade<TSubstream>>::Output,
-        _: Self::OutboundOpenInfo
+        _: Self::OutboundOpenInfo,
     ) {
+        info!("WorkProtocolsHandler inject_fully_negotiated_outbound");
         self.inject_fully_negotiated(proto);
     }
 
     fn inject_event(&mut self, message: WorkHandlerIn) {
+        info!("WorkProtocolsHandler inject_event, message={:?}", message);
         match message {
             WorkHandlerIn::Disable => self.disable(),
             WorkHandlerIn::Enable(endpoint) => self.enable(endpoint),
@@ -553,7 +722,7 @@ impl<TSubstream> ProtocolsHandler for WorkProtocolsHandler<TSubstream>
     }
 
     #[inline]
-    fn inject_dial_upgrade_error(&mut self, _: (), err: ProtocolsHandlerUpgrErr<void::Void>) {
+    fn inject_dial_upgrade_error(&mut self, _: (), err: ProtocolsHandlerUpgrErr<io::Error>) {
         let is_severe = match err {
             ProtocolsHandlerUpgrErr::Upgrade(_) => true,
             _ => false,
@@ -583,7 +752,8 @@ impl<TSubstream> ProtocolsHandler for WorkProtocolsHandler<TSubstream>
         // Flush the events queue if necessary.
         if !self.events_queue.is_empty() {
             let event = self.events_queue.remove(0);
-            return Ok(Async::Ready(event))
+            //info!("WorkProtocolsHandler poll events_queue");
+            return Ok(Async::Ready(event));
         }
 
         // Kill the connection if needed.
@@ -593,10 +763,252 @@ impl<TSubstream> ProtocolsHandler for WorkProtocolsHandler<TSubstream>
 
         // Process all the substreams.
         if let Some(event) = self.poll_state() {
-            return Ok(Async::Ready(event))
+            //info!("WorkProtocolsHandler poll_state");
+            return Ok(Async::Ready(event));
         }
 
         Ok(Async::NotReady)
+    }
+}
+
+pub struct RegisteredProtocol {
+    id: String,
+}
+
+impl RegisteredProtocol {
+    /// Creates a new `RegisteredProtocol`. The `custom_data` parameter will be
+    /// passed inside the `RegisteredProtocolOutput`.
+    pub fn new(protocol: String)
+               -> Self {
+        RegisteredProtocol {
+            id: protocol,
+        }
+    }
+
+    /// Returns the ID of the protocol.
+    pub fn id(&self) -> String {
+        self.id.clone()
+    }
+}
+
+impl Clone for RegisteredProtocol {
+    fn clone(&self) -> Self {
+        RegisteredProtocol {
+            id: self.id.clone(),
+        }
+    }
+}
+
+impl UpgradeInfo for RegisteredProtocol {
+    type Info = String;
+    type InfoIter = iter::Once<Self::Info>;
+
+    #[inline]
+    fn protocol_info(&self) -> Self::InfoIter {
+        // Report each version as an individual protocol.
+        iter::once(self.id.clone())
+    }
+}
+
+impl<TSubstream> InboundUpgrade<TSubstream> for RegisteredProtocol
+    where TSubstream: AsyncRead + AsyncWrite,
+{
+    type Output = RegisteredProtocolSubstream<TSubstream>;
+    type Future = future::FutureResult<Self::Output, io::Error>;
+    type Error = io::Error;
+
+    fn upgrade_inbound(
+        self,
+        socket: Negotiated<TSubstream>,
+        info: Self::Info,
+    ) -> Self::Future {
+        let framed: Framed<Negotiated<TSubstream>, UviBytes<Vec<u8>>> = {
+            let mut codec = UviBytes::default();
+            codec.set_max_len(16 * 1024 * 1024);        // 16 MiB hard limit for packets.
+            Framed::new(socket, codec)
+        };
+
+        let mut inner: Fuse<Framed<Negotiated<TSubstream>, UviBytes<Vec<u8>>>> = framed.fuse();
+
+        future::ok(RegisteredProtocolSubstream {
+            is_closing: false,
+            endpoint: Endpoint::Listener,
+            send_queue: VecDeque::new(),
+            requires_poll_complete: false,
+            inner: inner,
+            protocol_id: self.id,
+            clogged_fuse: false,
+        })
+    }
+}
+
+impl<TSubstream> OutboundUpgrade<TSubstream> for RegisteredProtocol
+    where TSubstream: AsyncRead + AsyncWrite,
+{
+    type Output = <Self as InboundUpgrade<TSubstream>>::Output;
+    type Future = <Self as InboundUpgrade<TSubstream>>::Future;
+    type Error = <Self as InboundUpgrade<TSubstream>>::Error;
+
+    fn upgrade_outbound(
+        self,
+        socket: Negotiated<TSubstream>,
+        info: Self::Info,
+    ) -> Self::Future {
+        let framed: Framed<Negotiated<TSubstream>, UviBytes<Vec<u8>>> = Framed::new(socket, UviBytes::default());
+
+        let mut inner: Fuse<Framed<Negotiated<TSubstream>, UviBytes<Vec<u8>>>> = framed.fuse();
+
+        future::ok(RegisteredProtocolSubstream {
+            is_closing: false,
+            endpoint: Endpoint::Dialer,
+            send_queue: VecDeque::new(),
+            requires_poll_complete: false,
+            inner: inner,
+            protocol_id: self.id,
+            clogged_fuse: false,
+        })
+    }
+}
+
+pub struct RegisteredProtocolSubstream<TSubstream> {
+    /// If true, we are in the process of closing the sink.
+    is_closing: bool,
+    /// Whether the local node opened this substream (dialer), or we received this substream from
+    /// the remote (listener).
+    endpoint: Endpoint,
+    /// Buffer of packets to send.
+    send_queue: VecDeque<Vec<u8>>,
+    /// If true, we should call `poll_complete` on the inner sink.
+    requires_poll_complete: bool,
+    /// The underlying substream.
+    inner: stream::Fuse<Framed<Negotiated<TSubstream>, UviBytes<Vec<u8>>>>,
+    /// Id of the protocol.
+    protocol_id: String,
+    /// If true, we have sent a "remote is clogged" event recently and shouldn't send another one
+    /// unless the buffer empties then fills itself again.
+    clogged_fuse: bool,
+}
+
+impl<TSubstream> RegisteredProtocolSubstream<TSubstream> {
+    /// Returns the protocol id.
+    #[inline]
+    pub fn protocol_id(&self) -> &str {
+        &self.protocol_id
+    }
+
+    /// Returns whether the local node opened this substream (dialer), or we received this
+    /// substream from the remote (listener).
+    pub fn endpoint(&self) -> Endpoint {
+        self.endpoint
+    }
+
+    /// Starts a graceful shutdown process on this substream.
+    ///
+    /// Note that "graceful" means that we sent a closing message. We don't wait for any
+    /// confirmation from the remote.
+    ///
+    /// After calling this, the stream is guaranteed to finish soon-ish.
+    pub fn shutdown(&mut self) {
+        self.is_closing = true;
+        self.send_queue.clear();
+    }
+
+    /// Sends a message to the substream.
+    pub fn send_message(&mut self, data: String) {
+        //info!("RegisteredProtocolSubstream send_message, data={}", data);
+        if self.is_closing {
+            return;
+        }
+
+        self.send_queue.push_back(data.into_bytes());
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum RegisteredProtocolEvent {
+    /// Received a message from the remote.
+    Message(String),
+
+    /// Diagnostic event indicating that the connection is clogged and we should avoid sending too
+    /// many messages to it.
+    Clogged {
+        /// Copy of the messages that are within the buffer, for further diagnostic.
+        messages: Vec<String>,
+    },
+}
+
+impl<TSubstream> Stream for RegisteredProtocolSubstream<TSubstream>
+    where TSubstream: AsyncRead + AsyncWrite {
+    type Item = RegisteredProtocolEvent;
+    type Error = io::Error;
+
+    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+        // Flushing the local queue.
+        while let Some(packet) = self.send_queue.pop_front() {
+            match self.inner.start_send(packet)? {
+                AsyncSink::NotReady(packet) => {
+                    self.send_queue.push_front(packet);
+                    break;
+                }
+                AsyncSink::Ready => self.requires_poll_complete = true,
+            }
+        }
+
+        // If we are closing, close as soon as the Sink is closed.
+        if self.is_closing {
+            return Ok(self.inner.close()?.map(|()| None));
+        }
+
+        // Indicating that the remote is clogged if that's the case.
+        if self.send_queue.len() >= 2048 {
+            if !self.clogged_fuse {
+                // Note: this fuse is important not just for preventing us from flooding the logs;
+                // 	if you remove the fuse, then we will always return early from this function and
+                //	thus never read any message from the network.
+                self.clogged_fuse = true;
+                return Ok(Async::Ready(Some(RegisteredProtocolEvent::Clogged {
+                    messages: self.send_queue.iter()
+                        .map(|m| String::from_utf8(m.to_vec()))
+                        .filter_map(Result::ok)
+                        .collect(),
+                })));
+            }
+        } else {
+            self.clogged_fuse = false;
+        }
+
+        // Flushing if necessary.
+        if self.requires_poll_complete {
+            if let Async::Ready(()) = self.inner.poll_complete()? {
+                self.requires_poll_complete = false;
+            }
+        }
+
+        // Receiving incoming packets.
+        // Note that `inner` is wrapped in a `Fuse`, therefore we can poll it forever.
+        match self.inner.poll()? {
+            Async::Ready(Some(data)) => {
+                //log::info!("-----inner.poll Ready Some");
+                let message = String::from_utf8(data.to_vec())
+                    .map_err(|_| {
+                        warn!(target: "sub-libp2p", "Couldn't decode packet sent by the remote: {:?}", data);
+                        io::ErrorKind::InvalidData
+                    })?;
+                Ok(Async::Ready(Some(RegisteredProtocolEvent::Message(message))))
+            }
+            Async::Ready(None) => {
+                //log::info!("-----inner.poll Ready None");
+                if !self.requires_poll_complete && self.send_queue.is_empty() {
+                    Ok(Async::Ready(None))
+                } else {
+                    Ok(Async::NotReady)
+                }
+            }
+            Async::NotReady => {
+                //log::info!("-----inner.poll NotReady");
+                Ok(Async::NotReady)
+            },
+        }
     }
 }
 
@@ -608,7 +1020,7 @@ impl<TSubstream> NetworkBehaviour for WorkBehaviour<TSubstream>
     type OutEvent = WorkOut;
 
     fn new_handler(&mut self) -> Self::ProtocolsHandler {
-        WorkProtocolsHandlerProto::new()
+        WorkProtocolsHandlerProto::new(self.protocol.clone())
     }
 
     fn addresses_of_peer(&mut self, _: &PeerId) -> Vec<Multiaddr> {
@@ -617,10 +1029,24 @@ impl<TSubstream> NetworkBehaviour for WorkBehaviour<TSubstream>
 
     fn inject_connected(&mut self, peer_id: PeerId, connected_point: ConnectedPoint) {
         info!("WorkBehaviour inject_connected, peer_id: {}, connected_point: {:?}", peer_id, connected_point);
+        self.peers.insert(peer_id.clone(), ());
+        info!("WorkBehaviour inject_connected, peers count: {}", self.peers.len());
+
+        self.events.push(NetworkBehaviourAction::SendEvent {
+            peer_id: peer_id,
+            event: WorkHandlerIn::Enable(connected_point.clone().into()),
+        });
     }
 
     fn inject_disconnected(&mut self, peer_id: &PeerId, endpoint: ConnectedPoint) {
         info!("WorkBehaviour inject_disconnected, peer_id: {}, endpoint: {:?}", peer_id, endpoint);
+        self.peers.remove(peer_id);
+        info!("WorkBehaviour inject_disconnected, peers count: {}", self.peers.len());
+
+        self.events.push(NetworkBehaviourAction::SendEvent {
+            peer_id: peer_id.clone(),
+            event: WorkHandlerIn::Disable,
+        });
     }
 
     fn inject_addr_reach_failure(&mut self, peer_id: Option<&PeerId>, addr: &Multiaddr, error: &dyn error::Error) {
@@ -637,7 +1063,6 @@ impl<TSubstream> NetworkBehaviour for WorkBehaviour<TSubstream>
         event: WorkHandlerOut,
     ) {
         info!("WorkBehaviour inject_node_event, source: {}, event: {:?}", source, event);
-
     }
 
     fn poll(
@@ -649,9 +1074,9 @@ impl<TSubstream> NetworkBehaviour for WorkBehaviour<TSubstream>
             Self::OutEvent,
         >,
     > {
-
         if !self.events.is_empty() {
-            return Async::Ready(self.events.remove(0))
+            //info!("WorkBehaviour events not empty");
+            return Async::Ready(self.events.remove(0));
         }
 
         Async::NotReady
@@ -823,8 +1248,8 @@ impl<TSubstream> NetworkBehaviourEventProcess<IdentifyEvent> for Behavior<TSubst
                 for addr in &info.listen_addrs {
                     self.discovery.kademlia.add_connected_address(&peer_id, addr.clone());
                 }
+                self.work.add_discovered_node(&peer_id);
                 info!(target: "sub-libp2p", "Add discovered node, Identified: {}", peer_id);
-                self.floodsub.add_node_to_partial_view(peer_id);
             }
             IdentifyEvent::Error { .. } => {}
             IdentifyEvent::SendBack { result: Err(ref err), ref peer_id } =>
@@ -835,18 +1260,20 @@ impl<TSubstream> NetworkBehaviourEventProcess<IdentifyEvent> for Behavior<TSubst
     }
 }
 
-impl<TSubstream> NetworkBehaviourEventProcess<FloodsubEvent> for Behavior<TSubstream> {
-    // Called when `floodsub` produces an event.
-    fn inject_event(&mut self, message: FloodsubEvent) {
-        if let FloodsubEvent::Message(message) = message {
-            info!(target: "sub-libp2p", "Received: '{:?}' from {:?}", String::from_utf8_lossy(&message.data), message.source);
-        }
+impl<TSubstream> NetworkBehaviourEventProcess<WorkOut> for Behavior<TSubstream> {
+    fn inject_event(&mut self, event: WorkOut) {
+        info!("WorkOut inject_event, event: {:?}", event);
+        self.events.push(event.into());
     }
 }
 
-impl<TSubstream> NetworkBehaviourEventProcess<WorkOut> for Behavior<TSubstream> {
-    fn inject_event(&mut self, event: WorkOut) {
-        self.events.push(event.into());
+impl<TSubstream> Behavior<TSubstream> {
+    fn poll<TEv>(&mut self) -> Async<NetworkBehaviourAction<TEv, BehaviourOut>> {
+        if !self.events.is_empty() {
+            return Async::Ready(NetworkBehaviourAction::GenerateEvent(self.events.remove(0)));
+        }
+
+        Async::NotReady
     }
 }
 
@@ -943,14 +1370,8 @@ pub fn run_network(cmd: RunCmd) {
 
     let transport = libp2p::build_development_transport(local_identity);
 
-    // Create a Floodsub topic
-    let floodsub_topic = libp2p::floodsub::TopicBuilder::new("sync").build();
-
     let mut swarm = {
-
         let mut behavior = Behavior::new(protocol_version, user_agent, local_public, bootnodes, cmd.shard_num);
-
-        behavior.floodsub.subscribe(floodsub_topic.clone());
 
         libp2p::Swarm::new(transport, behavior, local_peer_id)
     };
@@ -976,9 +1397,7 @@ pub fn run_network(cmd: RunCmd) {
         tokio::run(future::poll_fn(move || -> Result<_, ()> {
             loop {
                 match framed_stdin.poll().expect("Error while polling stdin") {
-                    Async::Ready(Some(line)) => {
-                        swarm.floodsub.publish(&floodsub_topic, line.as_bytes());
-                    }
+                    Async::Ready(Some(line)) => swarm.broadcast_custom_message(line),
                     Async::Ready(None) => panic!("Stdin closed"),
                     Async::NotReady => break,
                 };
