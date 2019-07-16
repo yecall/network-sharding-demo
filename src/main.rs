@@ -37,6 +37,7 @@ fn main() {
 fn run(version: VersionInfo){
 
     env_logger::builder().filter_level(log::LevelFilter::Info).init();
+//    env_logger::init();
 
     let args = match_args(version.clone());
 

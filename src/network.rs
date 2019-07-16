@@ -81,15 +81,17 @@ impl<TSubstream> Behavior<TSubstream> {
             work.events.push(NetworkBehaviourAction::DialPeer {peer_id: peer_id.clone()});
         }
 
+        let discovery = DiscoveryBehaviour {
+            user_defined: user_defined,
+            kademlia,
+            next_kad_random_query: Delay::new(clock.now()),
+            duration_to_next_kad: Duration::from_secs(1),
+            clock,
+            local_peer_id: local_public_key.into_peer_id(),
+        };
+
         Behavior {
-            discovery: DiscoveryBehaviour {
-                user_defined: user_defined,
-                kademlia,
-                next_kad_random_query: Delay::new(clock.now()),
-                duration_to_next_kad: Duration::from_secs(1),
-                clock,
-                local_peer_id: local_public_key.into_peer_id(),
-            },
+            discovery: discovery,
             identify: identify,
             work: work,
             shard_num: shard_num,
@@ -157,6 +159,16 @@ impl<TSubstream> WorkBehaviour<TSubstream> {
 
     pub fn add_discovered_node(&mut self, peer_id: &PeerId) {
         info!("WorkBehaviour add_discovered_node, peer_id: {}", peer_id);
+        self.peers.insert(peer_id.clone(), ());
+        info!("WorkBehaviour add_discovered_node, peers count: {}", self.peers.len());
+    }
+
+    pub fn disconnect_node(&mut self, peer_id: &PeerId){
+        self.events.push(NetworkBehaviourAction::SendEvent {
+            peer_id: peer_id.clone(),
+            event: WorkHandlerIn::Disable,
+        });
+        info!("WorkBehaviour disconnect_node, peer_id: {}", peer_id);
     }
 }
 
@@ -443,7 +455,7 @@ impl<TSubstream> WorkProtocolsHandler<TSubstream>
 
     /// Disables the handler.
     fn disable(&mut self) {
-        info!("WorkProtocolsHandler  disable");
+        info!("WorkProtocolsHandler disable");
         self.state = match mem::replace(&mut self.state, ProtocolState::Poisoned) {
             ProtocolState::Poisoned => {
                 error!(target: "sub-libp2p", "Handler with {:?} is in poisoned state",
@@ -1029,8 +1041,6 @@ impl<TSubstream> NetworkBehaviour for WorkBehaviour<TSubstream>
 
     fn inject_connected(&mut self, peer_id: PeerId, connected_point: ConnectedPoint) {
         info!("WorkBehaviour inject_connected, peer_id: {}, connected_point: {:?}", peer_id, connected_point);
-        self.peers.insert(peer_id.clone(), ());
-        info!("WorkBehaviour inject_connected, peers count: {}", self.peers.len());
 
         self.events.push(NetworkBehaviourAction::SendEvent {
             peer_id: peer_id,
@@ -1231,11 +1241,13 @@ impl<TSubstream> NetworkBehaviourEventProcess<IdentifyEvent> for Behavior<TSubst
                 //	care about (https://github.com/libp2p/rust-libp2p/issues/876)
                 if !info.protocol_version.eq(PROTOCOL_VERSION) {
                     warn!(target: "sub-libp2p", "Connected to a node with different protocol version : {:?}, will not treat as discovered", info);
+                    self.work.disconnect_node(&peer_id);
                     return;
                 }
                 let shard_token = format!("{}/{}", USERAGENT_SHARD, self.shard_num);
                 if !info.agent_version.contains(&shard_token) {
                     warn!(target: "sub-libp2p", "Connected to a node on different shard : {:?}, will not treat as discovered", info);
+                    self.work.disconnect_node(&peer_id);
                     return;
                 }
                 if info.listen_addrs.len() > 30 {
@@ -1249,7 +1261,7 @@ impl<TSubstream> NetworkBehaviourEventProcess<IdentifyEvent> for Behavior<TSubst
                     self.discovery.kademlia.add_connected_address(&peer_id, addr.clone());
                 }
                 self.work.add_discovered_node(&peer_id);
-                info!(target: "sub-libp2p", "Add discovered node, Identified: {}", peer_id);
+                info!(target: "sub-libp2p", "Identified: {}", peer_id);
             }
             IdentifyEvent::Error { .. } => {}
             IdentifyEvent::SendBack { result: Err(ref err), ref peer_id } =>
