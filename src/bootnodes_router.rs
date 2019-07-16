@@ -1,4 +1,4 @@
-use crate::params::BootNodesRouterCmd;
+use crate::params::{BootNodesRouterCmd, RunCmd};
 use crate::VersionInfo;
 use crate::params::{self, base_path, conf_path};
 use futures::future::Future;
@@ -12,13 +12,13 @@ use jsonrpc_core::IoHandler;
 use jsonrpc_derive::rpc;
 use jsonrpc_http_server::ServerBuilder;
 use std::thread;
-use futures::{prelude::*, future};
 use jsonrpc_client_http::{self, HttpTransport, HttpHandle};
 
 #[derive(Serialize, Deserialize)]
 #[derive(Debug, Clone)]
 pub struct Shard {
-    pub bootnodes: Vec<String>,
+    pub native: Vec<String>,
+    pub foreign: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -27,7 +27,7 @@ pub struct BootnodesRouterConf {
     pub shards: HashMap<String, Shard>,
 }
 
-fn get_bootnodes_router_conf(conf_path: &PathBuf) -> BootnodesRouterConf {
+fn get_local_bootnodes_router_conf(conf_path: &PathBuf) -> BootnodesRouterConf {
     let bootnodes_router_conf_path = conf_path.join("bootnodes-router.toml");
 
     info!("conf_path:{}", bootnodes_router_conf_path.to_string_lossy());
@@ -59,7 +59,7 @@ fn start_bootnodes_router(cmd: BootNodesRouterCmd, version: VersionInfo) {
 fn start_http(cmd: BootNodesRouterCmd, version: VersionInfo) {
     let conf_path = conf_path(&base_path(cmd.shared_params.base_path, version));
 
-    let conf: BootnodesRouterConf = get_bootnodes_router_conf(&conf_path);
+    let conf: BootnodesRouterConf = get_local_bootnodes_router_conf(&conf_path);
 
     info!("bootnodes router_conf={:?}", conf);
 
@@ -86,6 +86,22 @@ pub fn run_bootnodes_router(cmd: BootNodesRouterCmd, version: VersionInfo) {
     exit.wait().unwrap();
 
     signal.fire();
+}
+
+pub fn get_bootnodes_router_conf(bootnodes_router: Vec<String>) -> Option<BootnodesRouterConf> {
+
+    for one in bootnodes_router {
+        info!("bootnodes_router: {}", one);
+        let mut client = bootnodes_router_client(one.to_string());
+        let result = client.bootnodes().call();
+
+        match result {
+            Ok(result) => return Some(result),
+            Err(e) => { continue; }
+        }
+    }
+
+    None
 }
 
 fn rpc_handler(conf: BootnodesRouterConf) -> IoHandler<()> {

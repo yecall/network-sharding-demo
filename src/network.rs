@@ -1,6 +1,5 @@
-use crate::params::{self, RunCmd, BootNodesRouterCmd};
+use crate::params::{self, RunCmd};
 use crate::parse::parse_str_addr;
-use crate::bootnodes_router::bootnodes_router_client;
 use libp2p::core::{PeerId, Multiaddr, ProtocolsHandler, PublicKey, Swarm, Endpoint, ProtocolsHandlerEvent, UpgradeInfo, Negotiated};
 use libp2p::core::swarm::{NetworkBehaviour, NetworkBehaviourEventProcess, NetworkBehaviourAction, PollParameters, ConnectedPoint};
 use libp2p::NetworkBehaviour;
@@ -12,15 +11,12 @@ use libp2p::multiaddr::Protocol;
 use libp2p::kad::{Kademlia, KademliaOut};
 use libp2p::tokio_codec::{Framed, FramedRead, LinesCodec};
 use futures::{prelude::*, future, stream, Stream, stream::Fuse};
-use primitive_types::H256;
-use std::{str::FromStr, net::{Ipv4Addr, SocketAddr}, iter};
-use libp2p::identity::{Keypair, secp256k1::SecretKey};
-use libp2p::identify::{Identify, IdentifyEvent, protocol::IdentifyInfo};
-use libp2p::floodsub::{Floodsub, FloodsubEvent};
+use std::{net::{Ipv4Addr}, iter};
+use libp2p::identity::{Keypair};
+use libp2p::identify::{Identify, IdentifyEvent};
 use libp2p::core::protocols_handler::{SubstreamProtocol, ProtocolsHandlerUpgrErr, KeepAlive, IntoProtocolsHandler};
-use libp2p::core::upgrade::{self, InboundUpgrade, OutboundUpgrade};
+use libp2p::core::upgrade::{InboundUpgrade, OutboundUpgrade};
 use crate::bootnodes_router::{BootnodesRouterConf, Shard};
-use std::error::Error;
 use parity_codec::alloc::collections::HashMap;
 use smallvec::{smallvec, SmallVec};
 use std::borrow::Cow;
@@ -29,14 +25,10 @@ use std::error;
 use std::fmt;
 use std::io;
 use std::time::Instant;
-use void;
 use std::mem;
 use fnv::FnvHashMap;
 use std::collections::VecDeque;
 use unsigned_varint::codec::UviBytes;
-use bytes::Bytes;
-use bytes::buf;
-use tokio_io::_tokio_codec;
 
 const PROTOCOL_VERSION: &str = "network-sharding-demo/1.0.0";
 
@@ -1289,148 +1281,138 @@ impl<TSubstream> Behavior<TSubstream> {
     }
 }
 
-fn get_bootnodes_router(cmd: &RunCmd) -> Result<BootnodesRouterConf, ()> {
-    let router = &cmd.bootnodes_router;
-
-    for one in router {
-        info!("bootnodes_router: {}", one);
-        let mut client = bootnodes_router_client(one.to_string());
-        let result = client.bootnodes().call();
-
-        match result {
-            Ok(result) => return Ok(result),
-            Err(e) => { continue; }
-        }
-    }
-
-    Err(())
+pub struct Network{
+    cmd: RunCmd,
+    local_identity: Keypair,
+    bootnodes_router_conf: Option<BootnodesRouterConf>,
 }
 
-fn get_bootnodes(cmd: &RunCmd) -> Vec<(PeerId, Multiaddr)> {
-    let shard_num = cmd.shard_num;
+impl Network {
 
-    let bootnodes_router = get_bootnodes_router(&cmd);
+    pub fn new(cmd: RunCmd,
+               local_identity: Keypair,
+               bootnodes_router_conf: Option<BootnodesRouterConf>) -> Self{
 
-    let mut shards: HashMap<String, Shard>;
-
-    let bootnodes_str = match bootnodes_router {
-        Ok(result) => {
-            shards = result.shards;
-            let shard = shards.get(&format!("{}", shard_num));
-            match shard {
-                Some(shard) => &shard.bootnodes,
-                None => &cmd.bootnodes,
-            }
-        }
-        Err(e) => &cmd.bootnodes,
-    };
-
-    info!("bootnodes: {:?}", bootnodes_str);
-
-    let mut bootnodes = Vec::new();
-
-    // Process the bootnodes.
-    for bootnode in bootnodes_str.iter() {
-        match parse_str_addr(bootnode) {
-            Ok((peer_id, addr)) => {
-                bootnodes.push((peer_id, addr));
-            }
-            Err(_) => warn!(target: "sub-libp2p", "Not a valid bootnode address: {}", bootnode),
+        Network{
+            cmd,
+            local_identity,
+            bootnodes_router_conf,
         }
     }
 
-    bootnodes
-}
+    pub fn run(&self) {
+        let bootnodes = self.get_bootnodes();
 
-pub fn run_network(cmd: RunCmd) {
-    let bootnodes = get_bootnodes(&cmd);
+        let port = self.get_port();
 
-    let to_dial = bootnodes.clone();
+        let listen_addresses: Vec<Multiaddr> = vec![
+            iter::once(Protocol::Ip4(Ipv4Addr::new(0, 0, 0, 0)))
+                .chain(iter::once(Protocol::Tcp(port)))
+                .collect()
+        ];
 
-    // Process the node key.
-    let node_key: Option<SecretKey> = match cmd.node_key.map(|k| {
-        H256::from_str(k.as_str()).map_err(|_err| "").and_then(|bytes| SecretKey::from_bytes(bytes).map_err(|_err| ""))
-    }) {
-        Some(Ok(r)) => Some(r),
-        Some(Err(_e)) => None,
-        None => None,
-    };
+        let local_public = self.local_identity.public();
+        let local_peer_id = local_public.clone().into_peer_id();
+        info!(target: "sub-libp2p", "Local node identity is: {}", local_peer_id.to_base58());
 
-    Protocol::Ip4(Ipv4Addr::new(0, 0, 0, 0));
+        let user_agent = format!("{}/{}", USERAGENT_SHARD, &self.cmd.shard_num);
+        let protocol_version = PROTOCOL_VERSION.to_string();
 
-    // Process listen_addresses
-    let port = match cmd.shared_params.port {
-        Some(port) => port,
-        None => params::DEFAULT_PORT,
-    };
+        info!(target: "sub-libp2p", "Local node protocol version: {}, user agent: {}", protocol_version, user_agent);
 
-    let listen_addresses: Vec<Multiaddr> = vec![
-        iter::once(Protocol::Ip4(Ipv4Addr::new(0, 0, 0, 0)))
-            .chain(iter::once(Protocol::Tcp(port)))
-            .collect()
-    ];
+        let transport = libp2p::build_development_transport(self.local_identity.clone());
 
-    let local_identity = node_key.map_or(Keypair::generate_secp256k1(), |k| { Keypair::Secp256k1(k.into()) });
-    let local_public = local_identity.public();
-    let local_peer_id = local_public.clone().into_peer_id();
-    info!(target: "sub-libp2p", "Local node identity is: {}", local_peer_id.to_base58());
+        let mut swarm = {
+            let mut behavior = Behavior::new(protocol_version, user_agent, local_public, bootnodes, self.cmd.shard_num);
 
-    let user_agent = format!("{}/{}", USERAGENT_SHARD, &cmd.shard_num);
-    let protocol_version = PROTOCOL_VERSION.to_string();
+            libp2p::Swarm::new(transport, behavior, local_peer_id)
+        };
 
-    info!(target: "sub-libp2p", "Local node protocol version: {}, user agent: {}", protocol_version, user_agent);
-
-    let transport = libp2p::build_development_transport(local_identity);
-
-    let mut swarm = {
-        let mut behavior = Behavior::new(protocol_version, user_agent, local_public, bootnodes, cmd.shard_num);
-
-        libp2p::Swarm::new(transport, behavior, local_peer_id)
-    };
-
-    for listen_address in &listen_addresses {
-        ;
-        if let Err(err) = Swarm::listen_on(&mut swarm, listen_address.clone()) {
-            warn!(target: "sub-libp2p", "Can't listen on {} because: {:?}", listen_address, err)
-        }
-    }
-
-    //not need
-//    for (peer_id, _) in to_dial {
-//        Swarm::dial(&mut swarm, peer_id);
-//    }
-
-    let stdin = tokio_stdin_stdout::stdin(0);
-    let mut framed_stdin = FramedRead::new(stdin, LinesCodec::new());
-
-    let mut listening = false;
-
-    let thread = thread::Builder::new().name("network".to_string()).spawn(move || {
-        tokio::run(future::poll_fn(move || -> Result<_, ()> {
-            loop {
-                match framed_stdin.poll().expect("Error while polling stdin") {
-                    Async::Ready(Some(line)) => swarm.broadcast_custom_message(line),
-                    Async::Ready(None) => panic!("Stdin closed"),
-                    Async::NotReady => break,
-                };
+        for listen_address in &listen_addresses {
+            ;
+            if let Err(err) = Swarm::listen_on(&mut swarm, listen_address.clone()) {
+                warn!(target: "sub-libp2p", "Can't listen on {} because: {:?}", listen_address, err)
             }
+        }
 
-            loop {
-                match swarm.poll().expect("Error while polling swarm") {
-                    Async::Ready(Some(e)) => println!("{:?}", e),
-                    Async::Ready(None) | Async::NotReady => {
-                        if !listening {
-                            if let Some(a) = Swarm::listeners(&swarm).next() {
-                                info!("Listening on {:?}", a);
-                                listening = true;
+        let stdin = tokio_stdin_stdout::stdin(0);
+        let mut framed_stdin = FramedRead::new(stdin, LinesCodec::new());
+
+        let mut listening = false;
+
+        let thread = thread::Builder::new().name("network".to_string()).spawn(move || {
+            tokio::run(future::poll_fn(move || -> Result<_, ()> {
+                loop {
+                    match framed_stdin.poll().expect("Error while polling stdin") {
+                        Async::Ready(Some(line)) => swarm.broadcast_custom_message(line),
+                        Async::Ready(None) => panic!("Stdin closed"),
+                        Async::NotReady => break,
+                    };
+                }
+
+                loop {
+                    match swarm.poll().expect("Error while polling swarm") {
+                        Async::Ready(Some(e)) => println!("{:?}", e),
+                        Async::Ready(None) | Async::NotReady => {
+                            if !listening {
+                                if let Some(a) = Swarm::listeners(&swarm).next() {
+                                    info!("Listening on {:?}", a);
+                                    listening = true;
+                                }
                             }
+                            return Ok(Async::NotReady);
                         }
-                        return Ok(Async::NotReady);
                     }
                 }
-            }
-        }));
-    });
+            }));
+        });
 
-    info!("Run network successfully");
+        info!("Run network successfully");
+    }
+
+    fn get_port(&self) -> u16 {
+
+        let port = match self.cmd.shared_params.port {
+            Some(port) => port,
+            None => params::DEFAULT_PORT,
+        };
+
+        port
+    }
+
+    fn get_bootnodes(&self) -> Vec<(PeerId, Multiaddr)> {
+        let shard_num = self.cmd.shard_num;
+
+        let bootnodes_router_conf = (&self.bootnodes_router_conf).clone();
+
+        let mut shards: HashMap<String, Shard>;
+
+        let bootnodes_str = match bootnodes_router_conf {
+            Some(result) => {
+                shards = result.shards;
+                let shard = shards.get(&format!("{}", shard_num));
+                match shard {
+                    Some(shard) => &shard.native,
+                    None => &self.cmd.bootnodes,
+                }
+            }
+            None => &self.cmd.bootnodes,
+        };
+
+        info!("bootnodes: {:?}", bootnodes_str);
+
+        let mut bootnodes = Vec::new();
+
+        // Process the bootnodes.
+        for bootnode in bootnodes_str.iter() {
+            match parse_str_addr(bootnode) {
+                Ok((peer_id, addr)) => {
+                    bootnodes.push((peer_id, addr));
+                }
+                Err(_) => warn!(target: "sub-libp2p", "Not a valid bootnode address: {}", bootnode),
+            }
+        }
+
+        bootnodes
+    }
 }
