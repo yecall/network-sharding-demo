@@ -1,6 +1,6 @@
 use crate::params::{self, RunCmd};
 use crate::parse::parse_str_addr;
-use crate::client::Client;
+use crate::client::{self, Client, ParseMessage, Message};
 use libp2p::core::{PeerId, Multiaddr, ProtocolsHandler, PublicKey, Swarm, Endpoint, ProtocolsHandlerEvent, UpgradeInfo, Negotiated};
 use libp2p::core::swarm::{NetworkBehaviour, NetworkBehaviourEventProcess, NetworkBehaviourAction, PollParameters, ConnectedPoint};
 use libp2p::NetworkBehaviour;
@@ -103,6 +103,19 @@ impl<TSubstream> Behavior<TSubstream> {
         }
     }
 
+    pub fn broadcast_custom_message(&mut self, data: String) {
+
+        let mut shard_num_list = Vec::new();
+
+        for (shard_num, _) in &self.work.peers {
+            shard_num_list.push(shard_num.to_owned());
+        }
+
+        for shard_num in shard_num_list{
+            self.broadcast_custom_message_in_shard(data.clone(), shard_num);
+        }
+    }
+
     pub fn get_peer_ids(&self, shard_num: u16) -> Vec<PeerId> {
         let mut peer_ids: Vec<PeerId> = Vec::new();
 
@@ -113,6 +126,30 @@ impl<TSubstream> Behavior<TSubstream> {
         }
 
         peer_ids
+    }
+
+    pub fn on_foreign_channel_message(&mut self, message: String) {
+        info!("on_foreign_channel_message: {}", message);
+
+        let mut data = message.clone();
+        let message = message.parse_message();
+        match message {
+            Some(message) => match message {
+                Message::Transaction { from, to } => {
+                    if from == self.shard_num {
+                        self.broadcast_custom_message_in_shard(data, to);
+                    }
+                }
+                Message::Block { shard_num, height } => {
+                    if shard_num == self.shard_num {
+                        data = format!("BlockHead(shard_num: {}, height: {})", shard_num, height);
+                        self.broadcast_custom_message(data);
+                    }
+                }
+                _ => {}
+            }
+            None => {}
+        }
     }
 
     #[inline]
@@ -1097,6 +1134,27 @@ impl<TSubstream> NetworkBehaviour for WorkBehaviour<TSubstream>
         event: WorkHandlerOut,
     ) {
         info!("WorkBehaviour inject_node_event, source: {}, event: {:?}", source, event);
+
+        match event {
+            WorkHandlerOut::CustomMessage { message } => {
+                let message = message.parse_message();
+                match message {
+                    Some(message) => match message {
+                        t @ Message::Transaction { .. } => {
+                            info!("!!! Got a transaction: {:?}", t);
+                        }
+                        t @ Message::Block { .. } => {
+                            info!("!!! Got a block: {:?}", t);
+                        }
+                        t @ Message::BlockHead { .. } => {
+                            info!("!!! Got a block head: {:?}", t);
+                        }
+                    }
+                    None => {}
+                }
+            }
+            _ => {}
+        }
     }
 
     fn poll(
@@ -1392,13 +1450,15 @@ impl ForeignNetwork {
 
         let swarm_ref = Arc::new(Mutex::new(swarm));
 
+        let swarm_clone = swarm_ref.clone();
+
         let thread = thread::Builder::new().name("foreign_channel".to_string()).spawn(move || {
             tokio::run(future::poll_fn(move || -> Result<_, ()> {
                 loop {
                     foreign_notify.register();
                     match foreign_receiver.try_recv() {
                         Ok(msg) => {
-                            info!("====: {}", msg)
+                            swarm_clone.lock().on_foreign_channel_message(msg.clone());
                         }
                         Err(_) => {
                             return Ok(Async::NotReady);
