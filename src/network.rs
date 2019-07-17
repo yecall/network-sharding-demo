@@ -1387,7 +1387,7 @@ impl Network {
                     stdin_notify.register();
                     match stdin_receiver.try_recv() {
                         Ok(msg) => {
-                            swarm_clone.lock().broadcast_custom_message(msg);
+                            swarm_clone.lock().broadcast_custom_message(msg.clone());
 
                             foreign_sender.send(msg);
                             foreign_notify.notify();
