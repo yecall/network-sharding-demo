@@ -31,11 +31,9 @@ use fnv::FnvHashMap;
 use std::collections::VecDeque;
 use unsigned_varint::codec::UviBytes;
 use std::sync::Arc;
-use crossbeam_channel::{self as channel, Receiver, Sender, TryRecvError};
 use parking_lot::{Mutex, RwLock};
 
-
-const PROTOCOL_VERSION: &str = "network-sharding-demo/1.0.0";
+const PROTOCOL_VERSION: &str = "network-sharding-demo-foreign/1.0.0";
 
 const USERAGENT_SHARD: &str = "shard";
 
@@ -1296,19 +1294,19 @@ impl<TSubstream> Behavior<TSubstream> {
     }
 }
 
-pub struct Network {
+pub struct ForeignNetwork {
     cmd: RunCmd,
     local_identity: Keypair,
     bootnodes_router_conf: Option<BootnodesRouterConf>,
     client: Arc<Client>,
 }
 
-impl Network {
+impl ForeignNetwork {
     pub fn new(cmd: RunCmd,
                local_identity: Keypair,
                bootnodes_router_conf: Option<BootnodesRouterConf>,
                client: Arc<Client>) -> Self {
-        Network {
+        ForeignNetwork {
             cmd,
             local_identity,
             bootnodes_router_conf,
@@ -1350,29 +1348,7 @@ impl Network {
             }
         }
 
-        let receiver = self.client.stdin_receiver.clone();
-        let notify = self.client.stdin_notify.clone();
-
         let swarm_ref = Arc::new(Mutex::new(swarm));
-
-        let swarm_clone = swarm_ref.clone();
-
-        let thread = thread::Builder::new().name("io".to_string()).spawn(move || {
-            tokio::run(future::poll_fn(move || -> Result<_, ()> {
-                loop {
-                    notify.register();
-                    match receiver.try_recv() {
-                        Ok(msg) => {
-                            swarm_clone.lock().broadcast_custom_message(msg);
-                        }
-                        Err(_) => {
-                            return Ok(Async::NotReady)
-                        }
-                    }
-                }
-                Ok(Async::NotReady)
-            }));
-        });
 
         let mut listening = false;
 
@@ -1396,13 +1372,13 @@ impl Network {
             }));
         });
 
-        info!("Run network successfully");
+        info!("Run foreign network successfully");
     }
 
     fn get_port(&self) -> u16 {
-        let port = match self.cmd.shared_params.port {
+        let port = match self.cmd.foreign_port {
             Some(port) => port,
-            None => params::DEFAULT_PORT,
+            None => params::DEFAULT_FOREIGN_PORT,
         };
 
         port
@@ -1415,19 +1391,21 @@ impl Network {
 
         let mut shards: HashMap<String, Shard>;
 
+        let default = Vec::new();
+
         let bootnodes_str = match bootnodes_router_conf {
             Some(result) => {
                 shards = result.shards;
                 let shard = shards.get(&format!("{}", shard_num));
                 match shard {
-                    Some(shard) => &shard.native,
+                    Some(shard) => &shard.foreign,
                     None => &self.cmd.bootnodes,
                 }
             }
-            None => &self.cmd.bootnodes,
+            None => &default,
         };
 
-        info!("bootnodes: {:?}", bootnodes_str);
+        info!("foreign bootnodes: {:?}", bootnodes_str);
 
         let mut bootnodes = Vec::new();
 

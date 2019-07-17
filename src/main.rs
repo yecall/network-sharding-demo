@@ -2,6 +2,8 @@ mod params;
 mod network;
 mod parse;
 mod bootnodes_router;
+mod foreign_network;
+mod client;
 
 use futures::future::Future;
 use crate::params::{match_args, RunCmd};
@@ -11,6 +13,7 @@ use crate::bootnodes_router::get_bootnodes_router_conf;
 use primitive_types::H256;
 use libp2p::identity::{Keypair, secp256k1::SecretKey};
 use std::{str::FromStr};
+use std::sync::Arc;
 
 #[macro_use]
 extern crate jsonrpc_client_core;
@@ -56,12 +59,27 @@ fn run_main(cmd: RunCmd) {
 
     let bootnodes_router_conf = get_bootnodes_router_conf(cmd.bootnodes_router);
 
+
+    let client = Arc::new(client::Client::new());
+
+    client.run();
+
     let network = network::Network::new(
-        cmd_clone,
+        cmd_clone.clone(),
         local_identity.clone(),
-        bootnodes_router_conf);
+        bootnodes_router_conf.clone(),
+        client.clone(),
+    );
 
     network.run();
+
+    let foreign_network = foreign_network::ForeignNetwork::new(
+        cmd_clone,
+        local_identity,
+        bootnodes_router_conf,
+        client.clone());
+
+    foreign_network.run();
 
     exit.wait().unwrap();
 
@@ -69,7 +87,6 @@ fn run_main(cmd: RunCmd) {
 }
 
 fn get_local_identity(node_key: Option<String>) -> Keypair {
-
     let node_key: Option<SecretKey> = match node_key.map(|k| {
         H256::from_str(k.as_str()).map_err(|_err| "").and_then(|bytes| SecretKey::from_bytes(bytes).map_err(|_err| ""))
     }) {

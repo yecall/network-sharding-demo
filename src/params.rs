@@ -6,7 +6,7 @@ use clap::{App, SubCommand, AppSettings};
 
 pub const DEFAULT_PORT : u16 = 60001;
 pub const DEFAULT_BOOTNODES_ROUTER_PORT : u16 = 50001;
-
+pub const DEFAULT_FOREIGN_PORT : u16 = 61001;
 
 #[derive(Debug, Clone)]
 pub enum CoreParams {
@@ -31,6 +31,9 @@ pub struct RunCmd {
     #[allow(missing_docs)]
     #[structopt(flatten)]
     pub shared_params: SharedParams,
+
+    #[structopt(long = "foreign-port", value_name = "PORT")]
+    pub foreign_port: Option<u16>,
 
 }
 //
