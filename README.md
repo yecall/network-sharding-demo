@@ -68,7 +68,7 @@ $ target/debug/network-sharding-demo --bootnodes-router=http://localhost:50001 -
 ```
 
 ### 4. Scenarios
-### 4.1 Transaction in shard
+### 4.1 Transaction in a single shard
 **Operation:**
 
 Input ***"Transaction(from: 0, to: 0)"*** in the console of the node of shard 0 (the one started with --port=60002),
@@ -76,24 +76,34 @@ then
 
 **Result:**
 
-The node of shard 0 (the one started with --port=60001) printed ***"!!! Got a transaction: Transaction { from: 0, to: 0 }"***, while those of shard 1 did not print.
+The node of shard 0 (the one started with --port=60001) printed 
+
+***"!!! Got a transaction: Transaction { from: 0, to: 0 }"***, 
+
+while those of shard 1 did not print.
 
 ### 4.2 Transaction across shards
 **Operation:**
 
-Input ***"Transaction(from: 0, to: 1)"*** in the console of the node of shard 0 (the one started with --port=60002),
-then 
+Input ***"Transaction(from: 0, to: 1)"*** in the console of the node of shard 0 (the one started with --port=60002).
 
 **Result:**
 
-Both of the node of shard 0 (the one started with --port=60001) and the nodes of shard 1 (the one started with --port=60002 or --port=60012) printed ***"!!! Got a transaction: Transaction { from: 0, to: 1 }"***.
+Both of the node of shard 0 (the one started with --port=60001) and the nodes of shard 1 (the one started with --port=60002 or --port=60012) printed
+ 
+ ***"!!! Got a transaction: Transaction { from: 0, to: 1 }"***.
 
 ### 4.3 Block head syncing across shards
 **Operation:**
 
-Input ***"Block(shard_num: 0, height: 100)"*** in the console of the node of shard 0 (the one started with --port=60002),
-then 
+Input ***"Block(shard_num: 0, height: 100)"*** in the console of the node of shard 0 (the one started with --port=60002). 
 
 **Result:**
 
-The node of shard 0 (the one started with --port=60001)  printed ***"!!! Got a block: Block { shard_num: 0, height: 100 }"***, while the nodes of shard 1 (the one started with --port=60002 or --port=60012) printed ***"!!! Got a block head: BlockHead { shard_num: 0, height: 100 }"***.
+The node of shard 0 (the one started with --port=60001) printed 
+
+***"!!! Got a block: Block { shard_num: 0, height: 100 }"***, 
+
+while those of shard 1 (the ones started with --port=60002 or --port=60012) printed 
+
+***"!!! Got a block head: BlockHead { shard_num: 0, height: 100 }"***.
