@@ -104,14 +104,13 @@ impl<TSubstream> Behavior<TSubstream> {
     }
 
     pub fn broadcast_custom_message(&mut self, data: String) {
-
         let mut shard_num_list = Vec::new();
 
         for (shard_num, _) in &self.work.peers {
             shard_num_list.push(shard_num.to_owned());
         }
 
-        for shard_num in shard_num_list{
+        for shard_num in shard_num_list {
             self.broadcast_custom_message_in_shard(data.clone(), shard_num);
         }
     }
@@ -136,7 +135,7 @@ impl<TSubstream> Behavior<TSubstream> {
         match message {
             Some(message) => match message {
                 Message::Transaction { from, to } => {
-                    if from == self.shard_num {
+                    if from == self.shard_num && from != to {
                         self.broadcast_custom_message_in_shard(data, to);
                     }
                 }
