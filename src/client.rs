@@ -57,20 +57,28 @@ pub struct Client {
     pub stdin_sender: Sender<String>,
     pub stdin_receiver: Receiver<String>,
     pub stdin_notify: Arc<AtomicTask>,
+    pub foreign_sender: Sender<String>,
+    pub foreign_receiver: Receiver<String>,
+    pub foreign_notify: Arc<AtomicTask>,
 }
 
 impl Client {
     pub fn new() -> Self {
         let (stdin_sender, stdin_receiver) = channel::unbounded();
-        ;
 
         let stdin_notify = Arc::new(AtomicTask::new());
-        ;
+
+        let (foreign_sender, foreign_receiver) = channel::unbounded();
+
+        let foreign_notify = Arc::new(AtomicTask::new());
 
         Client {
             stdin_sender,
             stdin_receiver,
             stdin_notify,
+            foreign_sender,
+            foreign_receiver,
+            foreign_notify,
         }
     }
 

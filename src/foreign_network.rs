@@ -106,7 +106,7 @@ impl<TSubstream> Behavior<TSubstream> {
     pub fn get_peer_ids(&self, shard_num: u16) -> Vec<PeerId> {
         let mut peer_ids: Vec<PeerId> = Vec::new();
 
-        if let Some(a) = self.work.peers.get(&shard_num){
+        if let Some(a) = self.work.peers.get(&shard_num) {
             for (peer_id, _) in a {
                 peer_ids.push(peer_id.clone());
             }
@@ -1067,9 +1067,8 @@ impl<TSubstream> NetworkBehaviour for WorkBehaviour<TSubstream>
 
         let shard_num = self.peers_shard.get(peer_id);
 
-        if let Some(shard_num) = shard_num{
-
-            if let Some(mut a) = self.peers.get_mut(shard_num){
+        if let Some(shard_num) = shard_num {
+            if let Some(mut a) = self.peers.get_mut(shard_num) {
                 a.remove(peer_id);
             }
 
@@ -1388,11 +1387,31 @@ impl ForeignNetwork {
             }
         }
 
+        let foreign_receiver = self.client.foreign_receiver.clone();
+        let foreign_notify = self.client.foreign_notify.clone();
+
         let swarm_ref = Arc::new(Mutex::new(swarm));
+
+        let thread = thread::Builder::new().name("foreign_channel".to_string()).spawn(move || {
+            tokio::run(future::poll_fn(move || -> Result<_, ()> {
+                loop {
+                    foreign_notify.register();
+                    match foreign_receiver.try_recv() {
+                        Ok(msg) => {
+                            info!("====: {}", msg)
+                        }
+                        Err(_) => {
+                            return Ok(Async::NotReady);
+                        }
+                    }
+                }
+                Ok(Async::NotReady)
+            }));
+        });
 
         let mut listening = false;
 
-        let thread = thread::Builder::new().name("network".to_string()).spawn(move || {
+        let thread = thread::Builder::new().name("foreign_network".to_string()).spawn(move || {
             tokio::run(future::poll_fn(move || -> Result<_, ()> {
                 loop {
                     let mut s = swarm_ref.lock();

@@ -1371,20 +1371,26 @@ impl Network {
             }
         }
 
-        let receiver = self.client.stdin_receiver.clone();
-        let notify = self.client.stdin_notify.clone();
+        let stdin_receiver = self.client.stdin_receiver.clone();
+        let stdin_notify = self.client.stdin_notify.clone();
+
+        let foreign_sender = self.client.foreign_sender.clone();
+        let foreign_notify = self.client.foreign_notify.clone();
 
         let swarm_ref = Arc::new(Mutex::new(swarm));
 
         let swarm_clone = swarm_ref.clone();
 
-        let thread = thread::Builder::new().name("io".to_string()).spawn(move || {
+        let thread = thread::Builder::new().name("stdin_channel".to_string()).spawn(move || {
             tokio::run(future::poll_fn(move || -> Result<_, ()> {
                 loop {
-                    notify.register();
-                    match receiver.try_recv() {
+                    stdin_notify.register();
+                    match stdin_receiver.try_recv() {
                         Ok(msg) => {
                             swarm_clone.lock().broadcast_custom_message(msg);
+
+                            foreign_sender.send(msg);
+                            foreign_notify.notify();
                         }
                         Err(_) => {
                             return Ok(Async::NotReady);
