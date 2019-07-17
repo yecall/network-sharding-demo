@@ -32,6 +32,7 @@ use std::collections::VecDeque;
 use unsigned_varint::codec::UviBytes;
 use std::sync::Arc;
 use parking_lot::{Mutex, RwLock};
+use regex::Regex;
 
 const PROTOCOL_VERSION: &str = "network-sharding-demo-foreign/1.0.0";
 
@@ -94,19 +95,21 @@ impl<TSubstream> Behavior<TSubstream> {
         }
     }
 
-    pub fn broadcast_custom_message(&mut self, data: String) {
-        let peer_ids = self.get_peer_ids();
+    pub fn broadcast_custom_message_in_shard(&mut self, data: String, shard_num: u16) {
+        let peer_ids = self.get_peer_ids(shard_num);
 
         for peer_id in peer_ids {
             self.send_custom_message(&peer_id, data.clone());
         }
     }
 
-    pub fn get_peer_ids(&self) -> Vec<PeerId> {
+    pub fn get_peer_ids(&self, shard_num: u16) -> Vec<PeerId> {
         let mut peer_ids: Vec<PeerId> = Vec::new();
 
-        for (peer_id, _) in &self.work.peers {
-            peer_ids.push(peer_id.clone());
+        if let Some(a) = self.work.peers.get(&shard_num){
+            for (peer_id, _) in a {
+                peer_ids.push(peer_id.clone());
+            }
         }
 
         peer_ids
@@ -123,7 +126,9 @@ pub struct WorkBehaviour<TSubstream> {
 
     events: SmallVec<[NetworkBehaviourAction<WorkHandlerIn, WorkOut>; 4]>,
 
-    peers: FnvHashMap<PeerId, ()>,
+    peers_shard: FnvHashMap<PeerId, u16>,
+
+    peers: FnvHashMap<u16, FnvHashMap<PeerId, ()>>,
 
     /// Marker to pin the generics.
     marker: PhantomData<TSubstream>,
@@ -135,6 +140,7 @@ impl<TSubstream> WorkBehaviour<TSubstream> {
         WorkBehaviour {
             protocol: RegisteredProtocol { id: "/work".to_string() },
             events: SmallVec::new(),
+            peers_shard: FnvHashMap::default(),
             peers: FnvHashMap::default(),
             marker: PhantomData,
         }
@@ -152,10 +158,14 @@ impl<TSubstream> WorkBehaviour<TSubstream> {
         });
     }
 
-    pub fn add_discovered_node(&mut self, peer_id: &PeerId) {
-        info!("WorkBehaviour add_discovered_node, peer_id: {}", peer_id);
-        self.peers.insert(peer_id.clone(), ());
-        info!("WorkBehaviour add_discovered_node, peers count: {}", self.peers.len());
+    pub fn add_discovered_node(&mut self, peer_id: &PeerId, shard_num: u16) {
+        info!("WorkBehaviour add_discovered_node, peer_id: {}, shard_num: {}", peer_id, shard_num);
+
+        let mut of_shard = self.peers.entry(shard_num).or_insert(FnvHashMap::default());
+        of_shard.insert(peer_id.clone(), ());
+        self.peers_shard.insert(peer_id.clone(), shard_num);
+
+        info!("WorkBehaviour add_discovered_node, peers count:{}, peers: {:?}", self.peers_shard.len(), self.peers);
     }
 
     pub fn disconnect_node(&mut self, peer_id: &PeerId) {
@@ -1054,8 +1064,19 @@ impl<TSubstream> NetworkBehaviour for WorkBehaviour<TSubstream>
 
     fn inject_disconnected(&mut self, peer_id: &PeerId, endpoint: ConnectedPoint) {
         info!("WorkBehaviour inject_disconnected, peer_id: {}, endpoint: {:?}", peer_id, endpoint);
-        self.peers.remove(peer_id);
-        info!("WorkBehaviour inject_disconnected, peers count: {}", self.peers.len());
+
+        let shard_num = self.peers_shard.get(peer_id);
+
+        if let Some(shard_num) = shard_num{
+
+            if let Some(mut a) = self.peers.get_mut(shard_num){
+                a.remove(peer_id);
+            }
+
+            self.peers_shard.remove(peer_id);
+        }
+
+        info!("WorkBehaviour inject_disconnected, peers count:{}, peers: {:?}", self.peers_shard.len(), self.peers);
 
         self.events.push(NetworkBehaviourAction::SendEvent {
             peer_id: peer_id.clone(),
@@ -1248,12 +1269,18 @@ impl<TSubstream> NetworkBehaviourEventProcess<IdentifyEvent> for Behavior<TSubst
                     self.work.disconnect_node(&peer_id);
                     return;
                 }
-                let shard_token = format!("{}/{}", USERAGENT_SHARD, self.shard_num);
-                if !info.agent_version.contains(&shard_token) {
-                    warn!(target: "sub-libp2p", "Connected to a node on different shard : {:?}, will not treat as discovered", info);
+
+                let shard_num_res = get_shard_num(info.agent_version.clone());
+
+                if let Err(_) = shard_num_res {
+                    warn!(target: "sub-libp2p", "Connected to a node on unknown shard : {:?}, will not treat as discovered", info.agent_version);
                     self.work.disconnect_node(&peer_id);
-                    return;
                 }
+
+                let shard_num = shard_num_res.unwrap();
+
+                info!("Shard num: {}", shard_num);
+
                 if info.listen_addrs.len() > 30 {
                     warn!(target: "sub-libp2p", "Node {:?} has reported more than 30 addresses; \
 						it is identified by {:?} and {:?}", peer_id, info.protocol_version,
@@ -1264,7 +1291,7 @@ impl<TSubstream> NetworkBehaviourEventProcess<IdentifyEvent> for Behavior<TSubst
                 for addr in &info.listen_addrs {
                     self.discovery.kademlia.add_connected_address(&peer_id, addr.clone());
                 }
-                self.work.add_discovered_node(&peer_id);
+                self.work.add_discovered_node(&peer_id, shard_num);
                 self.events.push(BehaviourOut::Identified { peer_id: peer_id.clone(), info: info });
                 info!(target: "sub-libp2p", "Identified: {}", peer_id);
             }
@@ -1292,6 +1319,19 @@ impl<TSubstream> Behavior<TSubstream> {
 
         Async::NotReady
     }
+}
+
+fn get_shard_num(agent_version: String) -> Result<u16, ()> {
+    let re = Regex::new(&format!(r"{}/(\d+)", USERAGENT_SHARD)).unwrap();
+
+    let m: Vec<&str> = re.captures_iter(&agent_version).map(|c| c.get(1).unwrap().as_str()).collect();
+
+    if m.len() > 0 {
+        let m_int: u16 = m.get(0).unwrap().parse().unwrap();
+        return Ok(m_int);
+    }
+
+    Err(())
 }
 
 pub struct ForeignNetwork {
@@ -1391,16 +1431,16 @@ impl ForeignNetwork {
 
         let mut shards: HashMap<String, Shard>;
 
-        let default = Vec::new();
+        let mut default = Vec::new();
 
         let bootnodes_str = match bootnodes_router_conf {
             Some(result) => {
                 shards = result.shards;
-                let shard = shards.get(&format!("{}", shard_num));
-                match shard {
-                    Some(shard) => &shard.foreign,
-                    None => &self.cmd.bootnodes,
+
+                for (shard_num, shard) in shards {
+                    default.extend(shard.foreign);
                 }
+                &default
             }
             None => &default,
         };

@@ -38,6 +38,7 @@ unsigned-varint = { version = "0.2.1", features = ["codec"] }
 bytes = "0.4"
 crossbeam-channel = "0.3.6"
 parking_lot = "0.7.1"
+regex = "1"
 
 [features]
 default = ["std"]

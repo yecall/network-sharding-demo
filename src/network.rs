@@ -1,6 +1,6 @@
 use crate::params::{self, RunCmd};
 use crate::parse::parse_str_addr;
-use crate::client::Client;
+use crate::client::{self, Client, ParseMessage, Message};
 use libp2p::core::{PeerId, Multiaddr, ProtocolsHandler, PublicKey, Swarm, Endpoint, ProtocolsHandlerEvent, UpgradeInfo, Negotiated};
 use libp2p::core::swarm::{NetworkBehaviour, NetworkBehaviourEventProcess, NetworkBehaviourAction, PollParameters, ConnectedPoint};
 use libp2p::NetworkBehaviour;
@@ -1079,6 +1079,27 @@ impl<TSubstream> NetworkBehaviour for WorkBehaviour<TSubstream>
         event: WorkHandlerOut,
     ) {
         info!("WorkBehaviour inject_node_event, source: {}, event: {:?}", source, event);
+
+        match event {
+            WorkHandlerOut::CustomMessage { message } => {
+                let message = message.parse_message();
+                match message {
+                    Some(message) => match message {
+                        t @ Message::Transaction{..} => {
+                            info!("!!! Got a transaction: {:?}", t);
+                        },
+                        t @ Message::Block{..} => {
+                            info!("!!! Got a block: {:?}", t);
+                        },
+                        t @ Message::BlockHead{..} => {
+                            info!("!!! Got a block head: {:?}", t);
+                        }
+                    }
+                    None => {}
+                }
+            }
+            _ => {}
+        }
     }
 
     fn poll(
@@ -1366,7 +1387,7 @@ impl Network {
                             swarm_clone.lock().broadcast_custom_message(msg);
                         }
                         Err(_) => {
-                            return Ok(Async::NotReady)
+                            return Ok(Async::NotReady);
                         }
                     }
                 }
